@@ -1,0 +1,5 @@
+:root { color-scheme: light; }
+html { min-width: 320px; min-height: 100%; background: #f5f7f3; }
+body { min-width: 320px; min-height: 100vh; }
+button:focus-visible, a:focus-visible { outline: 3px solid #79b899; outline-offset: 3px; }
+

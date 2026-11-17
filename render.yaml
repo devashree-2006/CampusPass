@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: campuspass
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.11.0
+      - key: SECURITY_USERNAME
+        value: campus-security
+      - key: SECURITY_PASSWORD
+        generateValue: true
+
