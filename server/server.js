@@ -26,6 +26,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS attendance_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_token TEXT NOT NULL REFERENCES attendance_sessions(token),
     student_id TEXT NOT NULL, marked_at TEXT NOT NULL, distance REAL NOT NULL,
+    submitted_by TEXT NOT NULL DEFAULT '', group_size INTEGER NOT NULL DEFAULT 1,
     UNIQUE(session_token, student_id)
   );
   CREATE TABLE IF NOT EXISTS visitors (
@@ -50,6 +51,9 @@ db.exec(`
 
 const eventColumns = db.prepare("PRAGMA table_info(visitor_events)").all().map((column) => column.name);
 if (!eventColumns.includes("identity_verified")) db.exec("ALTER TABLE visitor_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0");
+const attendanceColumns = db.prepare("PRAGMA table_info(attendance_records)").all().map((column) => column.name);
+if (!attendanceColumns.includes("submitted_by")) db.exec("ALTER TABLE attendance_records ADD COLUMN submitted_by TEXT NOT NULL DEFAULT ''");
+if (!attendanceColumns.includes("group_size")) db.exec("ALTER TABLE attendance_records ADD COLUMN group_size INTEGER NOT NULL DEFAULT 1");
 
 const RADIUS_METRES = 50;
 const ATTENDANCE_QR_VALIDITY = 5 * 60 * 1000;
@@ -59,6 +63,7 @@ const VISITOR_VALIDITY_MS = 12 * 60 * 60 * 1000;
 const SECURITY_SESSION_MS = 12 * 60 * 60 * 1000;
 const guardSessions = new Map();
 const teacherSessions = new Map();
+const adminSessions = new Map();
 const loginAttempts = new Map();
 
 let qrSecret = db.prepare("SELECT value FROM settings WHERE key = 'visitor_qr_secret'").get()?.value;
@@ -130,6 +135,15 @@ function requireTeacher(req, res, next) {
   }
   req.teacher = session; next();
 }
+function requireAdmin(req, res, next) {
+  const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const session = token && adminSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) adminSessions.delete(token);
+    return jsonError(res, 401, "Administrator login expired. Please sign in again.");
+  }
+  req.admin = session; next();
+}
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, database: "sqlite", time: new Date().toISOString() }));
 app.post("/api/teacher/login", (req, res) => {
@@ -148,6 +162,22 @@ app.post("/api/teacher/login", (req, res) => {
 });
 app.post("/api/teacher/logout", requireTeacher, (req, res) => {
   const token = req.get("authorization").replace(/^Bearer\s+/i, ""); teacherSessions.delete(token); res.json({ success: true });
+});
+app.post("/api/admin/login", (req, res) => {
+  const now = Date.now(); const ip = req.ip || "unknown";
+  const attempts = loginAttempts.get(`admin:${ip}`) || { count: 0, resetAt: now + 15 * 60 * 1000 };
+  if (attempts.resetAt < now) { attempts.count = 0; attempts.resetAt = now + 15 * 60 * 1000; }
+  if (attempts.count >= 8) return jsonError(res, 429, "Too many login attempts. Please wait 15 minutes.");
+  const username = cleanText(req.body.username, 80); const password = typeof req.body.password === "string" ? req.body.password : "";
+  const expectedUsername = process.env.ADMIN_USERNAME || ""; const expectedPassword = process.env.ADMIN_PASSWORD || "";
+  const matches = Boolean(expectedUsername && expectedPassword) && username === expectedUsername && password.length === expectedPassword.length && timingSafeEqual(Buffer.from(password), Buffer.from(expectedPassword));
+  if (!matches) { attempts.count += 1; loginAttempts.set(`admin:${ip}`, attempts); return jsonError(res, 401, "Username or password is incorrect."); }
+  loginAttempts.delete(`admin:${ip}`); const token = randomBytes(32).toString("base64url");
+  adminSessions.set(token, { username, expiresAt: now + SECURITY_SESSION_MS });
+  res.json({ token, username, expiresAt: now + SECURITY_SESSION_MS });
+});
+app.post("/api/admin/logout", requireAdmin, (req, res) => {
+  const token = req.get("authorization").replace(/^Bearer\s+/i, ""); adminSessions.delete(token); res.json({ success: true });
 });
 app.post("/api/attendance/start", requireTeacher, async (req, res) => {
   const { teacherLat, teacherLon } = req.body;
@@ -174,7 +204,9 @@ app.get("/api/attendance/:token/qr", async (req, res) => {
 app.post("/api/attendance/verify", (req, res) => {
   const qr = parseAttendanceQr(req.body.payload); const token = qr?.token;
   const { studentLat, studentLon } = req.body; const studentId = cleanText(req.body.studentId, 80);
-  if (!token || !studentId || !Number.isFinite(studentLat) || !Number.isFinite(studentLon) || Math.abs(studentLat) > 90 || Math.abs(studentLon) > 180) return jsonError(res, 400, "Scan a current CampusPass QR code and provide a student ID and location.");
+  const additionalIds = Array.isArray(req.body.additionalStudentIds) ? req.body.additionalStudentIds.map((id) => cleanText(id, 80)).filter(Boolean) : [];
+  const studentIds = [...new Set([studentId, ...additionalIds])];
+  if (!token || !studentId || studentIds.length > 5 || !Number.isFinite(studentLat) || !Number.isFinite(studentLon) || Math.abs(studentLat) > 90 || Math.abs(studentLon) > 180) return jsonError(res, 400, "Use a current QR, valid location, and no more than five unique student IDs including your own.");
   const session = db.prepare("SELECT * FROM attendance_sessions WHERE token = ?").get(token);
   if (!session) return jsonError(res, 404, "Invalid attendance QR code.");
   if (Date.now() > session.expires_at) return jsonError(res, 410, "QR code expired. Attendance not marked.");
@@ -182,24 +214,33 @@ app.post("/api/attendance/verify", (req, res) => {
   const allowance = Math.min(100, session.teacher_accuracy + clampAccuracy(req.body.studentAccuracy));
   const estimatedDistance = Math.max(0, distance - allowance);
   if (estimatedDistance > RADIUS_METRES) return res.status(403).json({ success: false, message: "You are outside the class check-in area. Attendance not marked.", distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance), accuracyAllowance: Math.round(allowance) });
+  const existing = db.prepare(`SELECT student_id FROM attendance_records WHERE session_token = ? AND student_id IN (${studentIds.map(() => "?").join(",")})`).all(token, ...studentIds).map((row) => row.student_id);
+  if (existing.length) return res.status(409).json({ success: false, message: `Already marked in this session: ${existing.join(", ")}. No new students were added.` });
+  const markedAt = new Date().toISOString(); const groupSize = studentIds.length;
   try {
-    db.prepare("INSERT INTO attendance_records(session_token, student_id, marked_at, distance) VALUES (?, ?, ?, ?)").run(token, studentId, new Date().toISOString(), Math.round(distance));
-    res.json({ success: true, message: "Attendance marked successfully!", distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance) });
-  } catch { jsonError(res, 409, "Attendance already marked for this student."); }
+    db.exec("BEGIN IMMEDIATE");
+    const insert = db.prepare("INSERT INTO attendance_records(session_token, student_id, marked_at, distance, submitted_by, group_size) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const id of studentIds) insert.run(token, id, markedAt, Math.round(distance), studentId, groupSize);
+    db.exec("COMMIT");
+    res.json({ success: true, message: groupSize > 1 ? `Attendance marked for ${groupSize} students together.` : "Attendance marked successfully!", studentIds, distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance) });
+  } catch {
+    try { db.exec("ROLLBACK"); } catch { /* transaction may have failed before BEGIN */ }
+    jsonError(res, 409, "One or more student IDs could not be marked for this session.");
+  }
 });
 app.get("/api/attendance/:token/records", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
-  const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
+  const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance, submitted_by AS submittedBy, group_size AS groupSize FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
   res.json({ records, expiresAt: session.expires_at });
 });
 app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT token, teacher_name, class_name, created_at, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
-  const rows = db.prepare("SELECT student_id, marked_at, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "marked_at", "distance_metres"];
+  const rows = db.prepare("SELECT student_id, marked_at, distance, submitted_by, group_size FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
+  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "marked_at", "distance_metres", "submitted_by", "group_size"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const csv = [columns.join(","), ...rows.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
+  const csv = [columns.join(","), ...rows.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.marked_at, row.distance, row.submitted_by, row.group_size].map(escape).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${session.class_name.replace(/[^a-z0-9]+/gi, "-")}-attendance.csv` }).send(csv);
 });
 
@@ -260,7 +301,7 @@ app.get("/api/security/dashboard", requireGuard, (req, res) => {
   const attendanceToday = db.prepare("SELECT COUNT(*) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
   const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
   const approvalQueue = db.prepare(`SELECT v.pass_id AS passId, v.full_name AS fullName, v.phone, v.email, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.vehicle_number AS vehicleNumber, v.created_at AS createdAt, v.valid_until AS validUntil FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE a.status = 'pending' ORDER BY v.created_at`).all();
-  const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
+  const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt, r.submitted_by AS submittedBy, r.group_size AS groupSize FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
   res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, approvalQueue, presentStudents });
 });
 app.post("/api/security/visitor-approvals/:passId", requireGuard, (req, res) => {
@@ -270,6 +311,20 @@ app.post("/api/security/visitor-approvals/:passId", requireGuard, (req, res) => 
   if (!result.changes) return jsonError(res, 409, "This visitor request has already been decided or no longer exists.");
   res.json({ approvalStatus: decision });
 });
+app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
+  const now = Date.now(); const today = new Date(); today.setUTCHours(0, 0, 0, 0); const todayIso = today.toISOString();
+  const totalStudents = db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM attendance_records").get().count;
+  const totalVisitors = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
+  const studentsCheckedInToday = db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
+  const visitorsInside = db.prepare("SELECT COUNT(*) AS count FROM visitors WHERE status = 'inside'").get().count;
+  const activeSessions = db.prepare("SELECT COUNT(*) AS count FROM attendance_sessions WHERE expires_at > ?").get(now).count;
+  const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
+  const visitorRequestsToday = db.prepare("SELECT COUNT(*) AS count FROM visitors WHERE created_at >= ?").get(todayIso).count;
+  const attendanceToday = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt, r.submitted_by AS submittedBy, r.group_size AS groupSize FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY r.marked_at DESC LIMIT 60").all(todayIso);
+  const visitorEvents = db.prepare("SELECT e.id, e.event_type AS eventType, e.scanned_at AS scannedAt, e.guard_username AS guardUsername, v.full_name AS fullName, v.organization, v.host_name AS hostName FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC LIMIT 30").all();
+  const activeAttendanceSessions = db.prepare("SELECT token, class_name AS className, teacher_name AS teacherName, created_at AS createdAt, expires_at AS expiresAt, (SELECT COUNT(*) FROM attendance_records r WHERE r.session_token = attendance_sessions.token) AS attendanceCount FROM attendance_sessions WHERE expires_at > ? ORDER BY created_at DESC").all(now);
+  res.json({ admin: req.admin.username, totalStudents, totalVisitors, studentsCheckedInToday, visitorsInside, campusPresenceRecorded: studentsCheckedInToday + visitorsInside, activeSessions, pendingApprovals, visitorRequestsToday, attendanceToday, visitorEvents, activeAttendanceSessions });
+});
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
   const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
   const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude", "identity_verified"];
@@ -278,8 +333,8 @@ app.get("/api/security/events.csv", requireGuard, (_req, res) => {
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=campuspass-visitor-log.csv" }).send(csv);
 });
 app.get("/api/security/attendance.csv", requireGuard, (_req, res) => {
-  const rows = db.prepare("SELECT s.class_name, s.teacher_name, r.student_id, r.marked_at, r.distance FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token ORDER BY r.marked_at DESC").all();
-  const columns = ["class_name", "teacher_name", "student_id", "marked_at", "distance"];
+  const rows = db.prepare("SELECT s.class_name, s.teacher_name, r.student_id, r.marked_at, r.distance, r.submitted_by, r.group_size FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token ORDER BY r.marked_at DESC").all();
+  const columns = ["class_name", "teacher_name", "student_id", "marked_at", "distance", "submitted_by", "group_size"];
   const escape = (value) => '"' + String(value ?? "").replaceAll('"', '""') + '"';
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => escape(row[column])).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=campuspass-attendance.csv" }).send(csv);

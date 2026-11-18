@@ -13,4 +13,8 @@ services:
         value: campus-security
       - key: SECURITY_PASSWORD
         generateValue: true
+      - key: ADMIN_USERNAME
+        value: campus-admin
+      - key: ADMIN_PASSWORD
+        generateValue: true
 

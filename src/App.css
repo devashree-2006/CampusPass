@@ -190,6 +190,15 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .security-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .teacher-header { margin-top: 3px; }
 .teacher-login-layout { max-width: 870px; }
+.admin-login-layout { max-width: 920px; }
+.admin-dashboard { display: grid; gap: 16px; }
+.admin-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+.admin-presence-note { padding: 11px 14px; border: 1px solid #e7eee8; border-radius: 9px; background: #fbfdfb; color: #819087; font-size: 10px; line-height: 1.6; }
+.admin-panels { align-items: start; }
+.admin-panels .security-list-card { min-height: 235px; }
+.group-confirm { display: flex; align-items: flex-start; gap: 9px; margin: 12px 0 2px; color: #5c6e62; font-size: 10px; line-height: 1.5; }
+.group-confirm input { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 1px; accent-color: #397a57; }
+.group-confirm span { display: block; }
 .session-export-button { display: block; width: 100%; margin-top: 16px; }
 .approval-queue { margin: 0 0 16px; }
 .approval-queue-list { display: grid; gap: 10px; margin-top: 15px; }
@@ -228,6 +237,7 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
   .security-dashboard-header { align-items: flex-start; gap: 14px; flex-direction: column; }
   .approval-request { align-items: stretch; flex-direction: column; }
   .approval-request .approval-actions { flex-basis: auto; }
+  .admin-stats { grid-template-columns: 1fr 1fr; }
   .visitor-row { grid-template-columns: 31px minmax(0,1fr) auto; }
   .visitor-row-side { display: none; }
 }

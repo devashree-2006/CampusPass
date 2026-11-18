@@ -30,11 +30,17 @@ function App() {
   const [teacherToken, setTeacherToken] = useState(() => sessionStorage.getItem('campuspass.teacherToken') || '')
   const [teacherUsername, setTeacherUsername] = useState(() => sessionStorage.getItem('campuspass.teacherName') || '')
   const [teacherLoginForm, setTeacherLoginForm] = useState({ username: '', password: '' })
+  const [adminToken, setAdminToken] = useState(() => sessionStorage.getItem('campuspass.adminToken') || '')
+  const [adminUsername, setAdminUsername] = useState(() => sessionStorage.getItem('campuspass.adminName') || '')
+  const [adminLoginForm, setAdminLoginForm] = useState({ username: '', password: '' })
+  const [adminData, setAdminData] = useState(null)
   const [session, setSession] = useState(null)
   const [attendees, setAttendees] = useState([])
   const [attendanceQr, setAttendanceQr] = useState(null)
   const [attendanceQrSeconds, setAttendanceQrSeconds] = useState(0)
   const [studentId, setStudentId] = useState('')
+  const [additionalStudentIds, setAdditionalStudentIds] = useState('')
+  const [groupConfirmed, setGroupConfirmed] = useState(false)
   const [qrInput, setQrInput] = useState('')
   const [scanOn, setScanOn] = useState(false)
   const [scanPurpose, setScanPurpose] = useState('attendance')
@@ -78,6 +84,16 @@ function App() {
     }
   }, [])
 
+  const loadAdminDashboard = useCallback(async (token) => {
+    try { setAdminData(await request('/api/admin/dashboard', {}, token)) }
+    catch (error) {
+      if (error.message.includes('login expired')) {
+        sessionStorage.removeItem('campuspass.adminToken'); sessionStorage.removeItem('campuspass.adminName')
+        setAdminToken(''); setAdminUsername(''); setAdminData(null)
+      }
+    }
+  }, [])
+
   useEffect(() => {
     if (!session) return undefined
     const update = () => setRemaining(Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000)))
@@ -115,6 +131,13 @@ function App() {
     const timer = window.setInterval(() => loadSecurityDashboard(securityToken), 5000)
     return () => { window.clearTimeout(initial); window.clearInterval(timer) }
   }, [securityToken, loadSecurityDashboard])
+
+  useEffect(() => {
+    if (!adminToken) return undefined
+    const initial = window.setTimeout(() => loadAdminDashboard(adminToken), 0)
+    const timer = window.setInterval(() => loadAdminDashboard(adminToken), 10000)
+    return () => { window.clearTimeout(initial); window.clearInterval(timer) }
+  }, [adminToken, loadAdminDashboard])
 
   useEffect(() => {
     if (!visitorPassId) return undefined
@@ -219,6 +242,23 @@ function App() {
     setTeacherToken(''); setTeacherUsername(''); setSession(null); setAttendees([])
   }
 
+  async function adminLogin(event) {
+    event.preventDefault(); setBusy(true); setMessage(null)
+    try {
+      const data = await request('/api/admin/login', { method: 'POST', body: JSON.stringify(adminLoginForm) })
+      sessionStorage.setItem('campuspass.adminToken', data.token); sessionStorage.setItem('campuspass.adminName', data.username)
+      setAdminToken(data.token); setAdminUsername(data.username); setAdminLoginForm({ username: '', password: '' })
+      setMessage({ type: 'success', text: `Signed in as ${data.username}.` })
+    } catch (error) { setMessage({ type: 'error', text: error.message }) }
+    finally { setBusy(false) }
+  }
+
+  async function adminLogout() {
+    try { await request('/api/admin/logout', { method: 'POST' }, adminToken) } catch { /* local sign-out still completes */ }
+    sessionStorage.removeItem('campuspass.adminToken'); sessionStorage.removeItem('campuspass.adminName')
+    setAdminToken(''); setAdminUsername(''); setAdminData(null)
+  }
+
   async function downloadSessionAttendance() {
     if (!session?.token) return
     try {
@@ -234,10 +274,13 @@ function App() {
     try {
       const payload = qrInput.trim()
       if (!payload) throw new Error('Scan a current CampusPass QR code or paste its contents.')
+      const friendIds = [...new Set(additionalStudentIds.split(/[\n,]/).map((id) => id.trim()).filter(Boolean))].filter((id) => id !== studentId.trim())
+      if (friendIds.length > 4) throw new Error('You can check in yourself and up to four classmates at once.')
+      if (friendIds.length && !groupConfirmed) throw new Error('Confirm that every listed classmate is with you before submitting a group check-in.')
       const location = await getLocation()
-      const data = await request('/api/attendance/verify', { method: 'POST', body: JSON.stringify({ payload, studentId: studentId.trim(), studentLat: location.lat, studentLon: location.lon, studentAccuracy: location.accuracy }) })
+      const data = await request('/api/attendance/verify', { method: 'POST', body: JSON.stringify({ payload, studentId: studentId.trim(), additionalStudentIds: friendIds, studentLat: location.lat, studentLon: location.lon, studentAccuracy: location.accuracy }) })
       setMessage({ type: 'success', text: `${data.message} Estimated distance: ${data.distance} m. GPS accuracy is included.` })
-      setQrInput('')
+      setQrInput(''); setAdditionalStudentIds(''); setGroupConfirmed(false)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
   }
@@ -306,8 +349,8 @@ function App() {
 
   const expired = session && remaining === 0
   const switchMode = (nextMode) => { stopCamera(); setMode(nextMode); setMessage(null) }
-  const modeTitle = { teacher: 'Make every class count.', student: 'You’re one scan away.', visitor: 'Welcome to campus.', security: 'A safer campus starts here.' }
-  const modeSubtitle = { teacher: 'Sign in to start a secure class session and manage attendance.', student: 'Scan your class QR code to check in securely.', visitor: 'Register your visit and get your secure, rotating pass.', security: securityToken ? 'Manage campus entry with a live visitor log.' : 'Sign in to scan visitor passes and manage campus entry.' }
+  const modeTitle = { teacher: 'Make every class count.', student: 'You’re one scan away.', visitor: 'Welcome to campus.', security: 'A safer campus starts here.', admin: 'One clear view of campus.' }
+  const modeSubtitle = { teacher: 'Sign in to start a secure class session and manage attendance.', student: 'Scan your class QR code to check in securely.', visitor: 'Register your visit and get your secure, rotating pass.', security: securityToken ? 'Manage campus entry with a live visitor log.' : 'Sign in to scan visitor passes and manage campus entry.', admin: adminToken ? 'Campus activity and recorded presence at a glance.' : 'Sign in to view campus-wide attendance and visitor activity.' }
 
   return (
     <div className="app-shell">
@@ -317,6 +360,7 @@ function App() {
           <button className={mode === 'teacher' || mode === 'student' ? 'active' : ''} onClick={() => switchMode('teacher')}>Attendance</button>
           <button className={mode === 'visitor' ? 'active' : ''} onClick={() => switchMode('visitor')}>Visitor</button>
           <button className={mode === 'security' ? 'active' : ''} onClick={() => switchMode('security')}>Security</button>
+          <button className={mode === 'admin' ? 'active' : ''} onClick={() => switchMode('admin')}>Head / Admin</button>
         </nav>
         <div className="secure-label"><span className="secure-dot" /> Secure campus access</div>
       </header>
@@ -324,7 +368,7 @@ function App() {
       <main id="home">
         <section className="welcome-row">
           <div><div className="eyebrow">CAMPUSPASS · SMART CAMPUS ACCESS</div><h1>{modeTitle[mode]}</h1><p>{modeSubtitle[mode]}</p></div>
-          <div className="welcome-icon" aria-hidden="true">{mode === 'security' ? '◈' : mode === 'visitor' ? '⌖' : mode === 'student' ? '▦' : '✳'}</div>
+          <div className="welcome-icon" aria-hidden="true">{mode === 'security' ? '◈' : mode === 'admin' ? '▤' : mode === 'visitor' ? '⌖' : mode === 'student' ? '▦' : '✳'}</div>
         </section>
 
         {message && <div className={`notice ${message.type}`} role="status"><span>{message.type === 'success' ? '✓' : '!'}</span>{message.text}<button aria-label="Dismiss" onClick={() => setMessage(null)}>×</button></div>}
@@ -364,7 +408,7 @@ function App() {
             <div className="card-heading"><span className="step-number">01</span><div><h2>Scan your class QR</h2><p>Point your camera at the code shown by your teacher.</p></div></div>
             {scanOn && scanPurpose === 'attendance' ? <div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close camera</button></div> : <button type="button" className="scan-button" onClick={() => { setMessage(null); setScanPurpose('attendance'); setScanOn(true) }}><span className="scan-symbol">▦</span><span><strong>Open camera to scan</strong><small>Allow camera access when prompted</small></span><b>→</b></button>}
             <div className="or-divider"><span /> or enter QR code <span /></div>
-            <form onSubmit={markAttendance}><label htmlFor="qr-code">QR code text</label><textarea id="qr-code" rows="2" value={qrInput} onChange={(e) => setQrInput(e.target.value)} placeholder="Paste the code text here" /><label htmlFor="student-id">Student ID</label><input id="student-id" value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. STU2024012" required /><div className="location-note"><span>◎</span><div><strong>Location is checked when you submit</strong><small>Be in class and allow location access.</small></div></div><button className="primary-button" type="submit" disabled={busy || !studentId.trim()}>{busy ? 'Checking location…' : '✓  Mark my attendance'}</button></form>
+            <form onSubmit={markAttendance}><label htmlFor="qr-code">QR code text</label><textarea id="qr-code" rows="2" value={qrInput} onChange={(e) => setQrInput(e.target.value)} placeholder="Paste the code text here" /><label htmlFor="student-id">Your student ID</label><input id="student-id" value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. STU2024012" required /><label htmlFor="friend-student-ids">Classmates with you <span>OPTIONAL · UP TO 4</span></label><textarea id="friend-student-ids" rows="2" value={additionalStudentIds} onChange={(e) => setAdditionalStudentIds(e.target.value)} placeholder="Enter classmates’ IDs separated by commas or new lines" /><label className="group-confirm"><input type="checkbox" checked={groupConfirmed} onChange={(e) => setGroupConfirmed(e.target.checked)} /><span>I confirm everyone listed is physically here and agrees to this group check-in.</span></label><div className="location-note"><span>◎</span><div><strong>One device location is checked for the group</strong><small>Only include classmates who are with you in the room. Group submissions are recorded in the attendance audit.</small></div></div><button className="primary-button" type="submit" disabled={busy || !studentId.trim()}>{busy ? 'Checking location…' : '✓  Mark attendance'}</button></form>
           </div>
           <aside className="card how-card"><div className="how-icon">✳</div><div className="eyebrow">QUICK CHECK-IN</div><h2>Simple, secure, in the room.</h2><p>Your attendance is recorded only after the QR code and your location are verified.</p><ol><li><span>1</span>Scan the code your teacher shares</li><li><span>2</span>Enter your student ID</li><li><span>3</span>Allow location to confirm check-in</li></ol><div className="privacy-note">⌖ &nbsp; GPS uncertainty is considered.</div></aside>
         </section>}
@@ -407,6 +451,16 @@ function App() {
           </section>}
           <div className="security-panels"><div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">CURRENTLY INSIDE</div><h2>On-campus visitors</h2></div><span className="count-pill">{securityData.insideCount} inside</span></div>{securityData.inside.length ? <><p className="exit-hint">To record someone leaving, scan their refreshed visitor QR. The same scan records check-out.</p><div className="visitor-table">{securityData.inside.map((person) => <div className="visitor-row" key={person.passId}><div className="visitor-row-avatar">{person.fullName.slice(0, 1).toUpperCase()}</div><div className="visitor-row-main"><strong>{person.fullName}</strong><span>{person.organization} · Meeting {person.hostName}</span><small>{person.purpose}</small></div><div className="visitor-row-side"><strong>{person.vehicleNumber || 'No vehicle'}</strong><span>{person.phone}</span></div><span className="inside-pill">Inside</span></div>)}</div></> : <div className="roster-empty">No visitors are currently checked in.</div>}</div>
             <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>Recent gate activity</h2></div><span className="count-pill">Live</span></div>{securityData.recentEvents.length ? <div className="event-list">{securityData.recentEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername}{event.identityVerified ? ' · Photo ID matched' : ''}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">Scanned entries and exits will appear here.</div>}</div></div>
+        </section>)}
+
+        {mode === 'admin' && (!adminToken ? <section className="security-login-layout admin-login-layout"><div className="card security-login-card"><div className="security-lock">▤</div><div className="eyebrow">CAMPUS LEADERSHIP</div><h2>Head / admin sign in</h2><p>View attendance, visitor activity, and the recorded campus presence overview.</p><form onSubmit={adminLogin}><label htmlFor="admin-user">Username</label><input id="admin-user" autoComplete="username" value={adminLoginForm.username} onChange={(e) => setAdminLoginForm({ ...adminLoginForm, username: e.target.value })} required /><label htmlFor="admin-password">Password</label><input id="admin-password" type="password" autoComplete="current-password" value={adminLoginForm.password} onChange={(e) => setAdminLoginForm({ ...adminLoginForm, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Open admin dashboard'}</button></form></div><aside className="card how-card"><div className="eyebrow">CAMPUS OVERVIEW</div><h2>Everything important, in one place.</h2><p>See recorded student check-ins, visitor totals, gate activity, pending approvals, and currently open attendance sessions.</p></aside></section> : <section className="admin-dashboard">
+          <div className="security-dashboard-header"><div><div className="eyebrow">CAMPUS OVERVIEW</div><h2>Welcome, {adminUsername}</h2><p>Live campus activity refreshes every 10 seconds.</p></div><div className="security-actions"><button className="secondary-button" onClick={() => loadAdminDashboard(adminToken)}>Refresh now</button><button className="secondary-button" onClick={adminLogout}>Sign out</button></div></div>
+          <div className="admin-stats"><div className="card stat-card"><span className="stat-icon">♙</span><div><strong>{adminData?.totalStudents || 0}</strong><span>Student IDs recorded</span></div></div><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{adminData?.totalVisitors || 0}</strong><span>Visitor passes issued</span></div></div><div className="card stat-card"><span className="stat-icon">◎</span><div><strong>{adminData?.campusPresenceRecorded || 0}</strong><span>Recorded campus presence*</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{adminData?.visitorsInside || 0}</strong><span>Visitors currently checked in</span></div></div><div className="card stat-card"><span className="stat-icon">✓</span><div><strong>{adminData?.studentsCheckedInToday || 0}</strong><span>Distinct students checked in today</span></div></div><div className="card stat-card"><span className="stat-icon">▦</span><div><strong>{adminData?.activeSessions || 0}</strong><span>Attendance sessions open</span></div></div></div>
+          <div className="admin-presence-note">*Recorded campus presence adds today’s distinct student check-ins to visitors whose entry is still open. Student attendance has no checkout scan, so this is an operational estimate, not a physical headcount.</div>
+          <div className="security-panels admin-panels"><div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">OPEN CLASS SESSIONS</div><h2>Live attendance windows</h2></div><span className="count-pill">{adminData?.activeAttendanceSessions?.length || 0} live</span></div>{adminData?.activeAttendanceSessions?.length ? <div className="event-list">{adminData.activeAttendanceSessions.map((item) => <div className="event-row" key={item.token}><span className="event-mark">◷</span><div><strong>{item.className}</strong><span>{item.teacherName} · {item.attendanceCount} check-ins</span></div><time>Ends {new Date(item.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No attendance sessions are open right now.</div>}</div>
+            <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">TODAY’S STUDENT CHECK-INS</div><h2>Attendance activity</h2></div><span className="count-pill">{adminData?.attendanceToday?.length || 0} recent</span></div>{adminData?.attendanceToday?.length ? <div className="event-list">{adminData.attendanceToday.map((row, index) => <div className="event-row" key={`${row.className}-${row.studentId}-${row.markedAt}-${index}`}><span className="event-mark">✓</span><div><strong>{row.studentId}{row.groupSize > 1 ? <em> · group check-in</em> : ''}</strong><span>{row.className} · {row.teacherName}{row.groupSize > 1 ? ` · submitted by ${row.submittedBy}` : ''}</span></div><time>{new Date(row.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No student check-ins recorded today.</div>}</div>
+            <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">VISITOR GATE ACTIVITY</div><h2>Recent visitor movements</h2></div><span className="count-pill">{adminData?.pendingApprovals || 0} approvals pending</span></div>{adminData?.visitorEvents?.length ? <div className="event-list">{adminData.visitorEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername} · Host {event.hostName}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No visitor scans have been recorded.</div>}</div>
+          </div>
         </section>)}
       </main>
       <footer><span>© CampusPass</span><span>Attendance and visitor access, together.</span><span><i /> Secure campus access</span></footer>
