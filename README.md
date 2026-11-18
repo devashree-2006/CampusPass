@@ -20,9 +20,9 @@ Phone camera and location access require HTTPS. Use the deployed Render HTTPS ad
 
 - Teachers start a class session with a five minute check-in window and 50 metre location check. The classroom QR rotates every 30 seconds and is signed by the server.
 - Students scan from a different phone or paste the current QR text, enter their student ID, and check in once. GPS accuracy is included to account for indoor drift. Teachers see a live roster.
-- Visitors submit their full name, phone, email, organization, vehicle number, host, department, and visit purpose. Their pass is valid for 12 hours.
-- Visitor passes rotate every 30 seconds. Guard scans check visitors in or out automatically, reject stale or reused codes, record the guard and scan time, and optionally record the guard phone's GPS location.
-- Security staff sign in with a provisioned account, see live occupancy and recent activity, and export the audit log as CSV.
+- Visitors submit their full name, phone, email, organization, vehicle number, host, department, and visit purpose. The host gets a one-use approval link; the rotating pass activates only after approval.
+- Visitor passes rotate every 30 seconds. Guard scans check visitors in or out, reject stale or reused codes, require a photo ID match before check-in, and record the guard, timestamp, ID confirmation, and optional GPS location.
+- Security staff sign in with a provisioned account, see daily attendance and visitor counts, pending approvals, live occupancy, and gate activity, and export the visitor audit log as CSV. The searchable emergency roll call lists today's recorded student check-ins and visitors currently inside, with a print view.
 - Visitor details, gate events, attendance sessions, and attendance records are stored in SQLite.
 
 ## Deploy to Render Free
@@ -30,3 +30,4 @@ Phone camera and location access require HTTPS. Use the deployed Render HTTPS ad
 The `render.yaml` file configures a free Node web service, Node 24, HTTPS hosting, and an automatically generated security password. The app uses SQLite by default. Render Free has an ephemeral filesystem, so attendance records, visitor passes, and security events may be erased when the service sleeps, restarts, or redeploys. Use this setup for demos only; persistent records require a paid persistent disk or migration to a managed database.
 
 Push the project to GitHub, then create a Render Blueprint from the repository. After deployment, retrieve the generated `SECURITY_PASSWORD` from the service environment settings and share it only with authorized security staff.
+

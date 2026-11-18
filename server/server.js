@@ -1,6 +1,6 @@
 import express from "express";
 import QRCode from "qrcode";
-import { randomUUID, randomBytes, createHmac, scryptSync, timingSafeEqual } from "crypto";
+import { randomUUID, randomBytes, createHash, createHmac, scryptSync, timingSafeEqual } from "crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "fs";
 import path from "path";
@@ -34,14 +34,22 @@ db.exec(`
     purpose TEXT NOT NULL, vehicle_number TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'outside',
     valid_from INTEGER NOT NULL, valid_until INTEGER NOT NULL, created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS visitor_approvals (
+    pass_id TEXT PRIMARY KEY REFERENCES visitors(pass_id), token_hash TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+    created_at TEXT NOT NULL, decided_at TEXT
+  );
   CREATE TABLE IF NOT EXISTS visitor_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, pass_id TEXT NOT NULL REFERENCES visitors(pass_id),
     guard_username TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('CHECK_IN','CHECK_OUT')),
-    scanned_at TEXT NOT NULL, latitude REAL, longitude REAL, qr_slot INTEGER NOT NULL,
+    scanned_at TEXT NOT NULL, latitude REAL, longitude REAL, qr_slot INTEGER NOT NULL, identity_verified INTEGER NOT NULL DEFAULT 0,
     UNIQUE(pass_id, qr_slot)
   );
   CREATE INDEX IF NOT EXISTS visitor_events_time_idx ON visitor_events(scanned_at DESC);
 `);
+
+const eventColumns = db.prepare("PRAGMA table_info(visitor_events)").all().map((column) => column.name);
+if (!eventColumns.includes("identity_verified")) db.exec("ALTER TABLE visitor_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0");
 
 const RADIUS_METRES = 50;
 const ATTENDANCE_QR_VALIDITY = 5 * 60 * 1000;
@@ -168,20 +176,42 @@ app.post("/api/visitors", (req, res) => {
   if (!visitor.fullName || !visitor.phone || !visitor.email || !visitor.organization || !visitor.hostName || !visitor.hostDepartment || !visitor.purpose) return jsonError(res, 400, "Complete all required visitor and host details.");
   if (!/^[+0-9][0-9 +()-]{6,30}$/.test(visitor.phone)) return jsonError(res, 400, "Enter a valid phone number.");
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(visitor.email)) return jsonError(res, 400, "Enter a valid email address.");
-  const passId = randomBytes(24).toString("base64url"); const now = Date.now(); const validUntil = now + VISITOR_VALIDITY_MS;
+  const passId = randomBytes(24).toString("base64url"); const approvalToken = randomBytes(32).toString("base64url");
+  const tokenHash = createHash("sha256").update(approvalToken).digest("hex");
+  const now = Date.now(); const validUntil = now + VISITOR_VALIDITY_MS;
   db.prepare(`INSERT INTO visitors(pass_id, full_name, phone, email, organization, host_name, host_department, purpose, vehicle_number, valid_from, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(passId, visitor.fullName, visitor.phone, visitor.email, visitor.organization, visitor.hostName, visitor.hostDepartment, visitor.purpose, visitor.vehicleNumber, now, validUntil, new Date(now).toISOString());
-  res.status(201).json({ passId, visitor, validUntil });
+  db.prepare("INSERT INTO visitor_approvals(pass_id, token_hash, status, created_at) VALUES (?, ?, 'pending', ?)").run(passId, tokenHash, new Date(now).toISOString());
+  const approvalUrl = req.protocol + "://" + req.get("host") + "/?approve=" + encodeURIComponent(approvalToken);
+  res.status(201).json({ passId, visitor, validUntil, approvalUrl });
+});
+app.get("/api/visitor-approvals/:token", (req, res) => {
+  const tokenHash = createHash("sha256").update(req.params.token).digest("hex");
+  const approval = db.prepare("SELECT a.status AS approvalStatus, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.valid_until AS validUntil FROM visitor_approvals a JOIN visitors v ON v.pass_id = a.pass_id WHERE a.token_hash = ?").get(tokenHash);
+  if (!approval) return jsonError(res, 404, "This host approval link is invalid.");
+  res.set("Cache-Control", "no-store"); res.json(approval);
+});
+app.post("/api/visitor-approvals/:token", (req, res) => {
+  const decision = req.body.decision;
+  if (!["approved", "denied"].includes(decision)) return jsonError(res, 400, "Choose approve or decline.");
+  const tokenHash = createHash("sha256").update(req.params.token).digest("hex");
+  const approval = db.prepare("SELECT pass_id, status FROM visitor_approvals WHERE token_hash = ?").get(tokenHash);
+  if (!approval) return jsonError(res, 404, "This host approval link is invalid.");
+  if (approval.status !== "pending") return jsonError(res, 409, "This visit has already been decided.");
+  db.prepare("UPDATE visitor_approvals SET status = ?, decided_at = ? WHERE pass_id = ? AND status = 'pending'").run(decision, new Date().toISOString(), approval.pass_id);
+  res.json({ approvalStatus: decision });
 });
 app.get("/api/visitors/:passId/qr", async (req, res) => {
-  const visitor = db.prepare("SELECT pass_id, full_name, host_name, host_department, purpose, organization, vehicle_number, status, valid_from, valid_until FROM visitors WHERE pass_id = ?").get(req.params.passId);
+  const visitor = db.prepare("SELECT pass_id, full_name, host_name, host_department, purpose, organization, vehicle_number, status, valid_from, valid_until, (SELECT status FROM visitor_approvals WHERE pass_id = visitors.pass_id) AS approval_status FROM visitors WHERE pass_id = ?").get(req.params.passId);
   if (!visitor) return jsonError(res, 404, "Visitor pass not found.");
+  const visitorDetails = { fullName: visitor.full_name, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, organization: visitor.organization, vehicleNumber: visitor.vehicle_number, status: visitor.status, approvalStatus: visitor.approval_status, validUntil: visitor.valid_until };
+  if (visitor.approval_status !== "approved") return res.json({ qrCode: null, visitor: visitorDetails });
   if (Date.now() > visitor.valid_until && visitor.status !== "inside") return jsonError(res, 410, "This visitor pass has expired.");
   const slot = Math.floor(Date.now() / VISITOR_QR_SLOT_MS);
   const payload = JSON.stringify({ passId: visitor.pass_id, slot, signature: qrSignature(visitor.pass_id, slot) });
   const qrCode = await QRCode.toDataURL(payload, { errorCorrectionLevel: "H", margin: 2, width: 320 });
   res.set("Cache-Control", "no-store");
-  res.json({ qrCode, payload, rotatesAt: (slot + 1) * VISITOR_QR_SLOT_MS, visitor: { fullName: visitor.full_name, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, organization: visitor.organization, vehicleNumber: visitor.vehicle_number, status: visitor.status, validUntil: visitor.valid_until } });
+  res.json({ qrCode, payload, rotatesAt: (slot + 1) * VISITOR_QR_SLOT_MS, visitor: visitorDetails });
 });
 
 app.post("/api/security/login", (req, res) => {
@@ -203,12 +233,18 @@ app.post("/api/security/logout", requireGuard, (req, res) => {
 });
 app.get("/api/security/dashboard", requireGuard, (req, res) => {
   const inside = db.prepare(`SELECT pass_id AS passId, full_name AS fullName, phone, email, organization, host_name AS hostName, host_department AS hostDepartment, purpose, vehicle_number AS vehicleNumber, created_at AS createdAt FROM visitors WHERE status = 'inside' ORDER BY full_name`).all();
-  const recentEvents = db.prepare(`SELECT e.id, e.event_type AS eventType, e.scanned_at AS scannedAt, e.guard_username AS guardUsername, e.latitude, e.longitude, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.purpose, v.vehicle_number AS vehicleNumber FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC LIMIT 40`).all();
+  const recentEvents = db.prepare(`SELECT e.id, e.event_type AS eventType, e.scanned_at AS scannedAt, e.guard_username AS guardUsername, e.latitude, e.longitude, e.identity_verified AS identityVerified, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.purpose, v.vehicle_number AS vehicleNumber FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC LIMIT 40`).all();
   const insideCount = db.prepare("SELECT COUNT(*) AS count FROM visitors WHERE status = 'inside'").get().count;
-  res.json({ inside, insideCount, recentEvents, guard: req.guard.username });
+  const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+  const todayIso = todayStart.toISOString();
+  const visitorsToday = db.prepare("SELECT COUNT(*) AS count FROM visitor_events WHERE scanned_at >= ? AND event_type = 'CHECK_IN'").get(todayIso).count;
+  const attendanceToday = db.prepare("SELECT COUNT(*) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
+  const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
+  const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
+  res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, presentStudents });
 });
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
-  const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
+  const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
   const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => escape(row[column])).join(","))].join("\r\n");
@@ -217,16 +253,19 @@ app.get("/api/security/events.csv", requireGuard, (_req, res) => {
 app.post("/api/security/scan", requireGuard, (req, res) => {
   const data = parseVisitorQr(req.body.payload);
   if (!data) return jsonError(res, 400, "QR code is invalid or has expired. Ask the visitor to refresh their code.");
-  const visitor = db.prepare("SELECT * FROM visitors WHERE pass_id = ?").get(data.passId);
+  const visitor = db.prepare("SELECT v.*, a.status AS approval_status FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE v.pass_id = ?").get(data.passId);
   if (!visitor) return jsonError(res, 404, "Visitor pass not found.");
+  if (visitor.approval_status !== "approved") return jsonError(res, 403, "Host approval is required before this pass can be used.");
   const now = Date.now();
   if (visitor.status !== "inside" && (now < visitor.valid_from || now > visitor.valid_until)) return jsonError(res, 410, "Visitor pass is outside its valid check-in time.");
   const eventType = visitor.status === "inside" ? "CHECK_OUT" : "CHECK_IN";
+  const identityVerified = req.body.identityVerified === true;
+  if (eventType === "CHECK_IN" && !identityVerified) return jsonError(res, 403, "Confirm the visitor photo ID before checking them in.");
   const latitude = Number.isFinite(req.body.latitude) && Math.abs(req.body.latitude) <= 90 ? req.body.latitude : null;
   const longitude = Number.isFinite(req.body.longitude) && Math.abs(req.body.longitude) <= 180 ? req.body.longitude : null;
   try {
     db.exec("BEGIN IMMEDIATE");
-    db.prepare("INSERT INTO visitor_events(pass_id, guard_username, event_type, scanned_at, latitude, longitude, qr_slot) VALUES (?, ?, ?, ?, ?, ?, ?)").run(visitor.pass_id, req.guard.username, eventType, new Date(now).toISOString(), latitude, longitude, data.slot);
+    db.prepare("INSERT INTO visitor_events(pass_id, guard_username, event_type, scanned_at, latitude, longitude, qr_slot, identity_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(visitor.pass_id, req.guard.username, eventType, new Date(now).toISOString(), latitude, longitude, data.slot, identityVerified ? 1 : 0);
     db.prepare("UPDATE visitors SET status = ? WHERE pass_id = ?").run(eventType === "CHECK_IN" ? "inside" : "outside", visitor.pass_id);
     db.exec("COMMIT");
   } catch (error) {

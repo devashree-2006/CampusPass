@@ -174,6 +174,17 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .scan-launch-card span { margin-top: 4px; color: #85958b; font-size: 9px; }
 .scan-launch-card .primary-button { width: auto; padding: 12px 14px; }
 .security-camera-card { margin-bottom: 16px; padding: 14px; }
+.approval-details { margin: 18px 0; padding: 18px; border: 1px solid #e8eee9; border-radius: 14px; }
+.approval-details h3 { margin: 0; color: #244233; font-size: 20px; }
+.approval-details > p { margin: 5px 0 14px; color: #839087; }
+.approval-actions { display: flex; gap: 10px; margin-top: 16px; }
+.approval-actions > * { flex: 1; }
+.approval-pending { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.approval-pending strong { color: #315140; }
+.approval-pending small { color: #839087; line-height: 1.5; }
+.approval-pending a { color: #397a57; font-size: 12px; }
+.id-check { display: flex; align-items: center; gap: 9px; max-width: 500px; margin: 0 auto 12px; color: #425b4b; font-size: 12px; }
+.id-check input { width: 17px; height: 17px; accent-color: #397a57; }
 .security-camera-card .camera-box { max-width: 500px; margin: 0 auto; }
 .security-camera-card > p { margin: 10px 0 2px; color: #85938a; text-align: center; font-size: 10px; }
 .security-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
@@ -215,5 +226,19 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
   .security-actions { width: 100%; }
   .security-actions button { flex: 1; }
   .security-stats { grid-template-columns: 1fr 1fr; }
+}
+
+
+.emergency-roll-call { margin: 0 0 16px; padding: 22px; }
+.emergency-roll-call .roster-heading { align-items: flex-start; }
+.emergency-roll-call .roster-heading p { margin: 5px 0 0; color: #849189; font-size: 11px; }
+.emergency-search-label { display: block; margin: 18px 0 7px; color: #56685c; font-size: 11px; font-weight: 700; }
+.emergency-roll-call > input { max-width: 480px; }
+.emergency-panels { margin-top: 14px; }
+.emergency-panels .security-list-card { background: #fbfcfb; }
+@media print {
+  .topbar, footer, .security-dashboard-header, .security-stats, .security-camera-card, .security-panels, .notice, .mode-switch { display: none !important; }
+  .emergency-roll-call { display: block !important; box-shadow: none; border: 0; }
+  .emergency-panels { display: grid !important; grid-template-columns: 1fr 1fr; }
 }
 

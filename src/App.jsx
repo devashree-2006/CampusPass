@@ -25,7 +25,8 @@ function getLocation() {
 }
 
 function App() {
-  const [mode, setMode] = useState('teacher')
+  const approvalToken = new URLSearchParams(window.location.search).get('approve') || ''
+  const [mode, setMode] = useState(() => approvalToken ? 'hostApproval' : 'teacher')
   const [teacherName, setTeacherName] = useState('')
   const [className, setClassName] = useState('')
   const [session, setSession] = useState(null)
@@ -45,6 +46,11 @@ function App() {
 
   const [visitor, setVisitor] = useState({ fullName: '', phone: '', email: '', organization: '', hostName: '', hostDepartment: '', purpose: '', vehicleNumber: '' })
   const [visitorPassId, setVisitorPassId] = useState(() => sessionStorage.getItem('campuspass.visitorPass') || '')
+  const [approvalLink, setApprovalLink] = useState(() => sessionStorage.getItem('campuspass.visitorApproval') || '')
+  const [hostApproval, setHostApproval] = useState(null)
+  const [identityVerified, setIdentityVerified] = useState(false)
+  const [showEmergency, setShowEmergency] = useState(false)
+  const [emergencySearch, setEmergencySearch] = useState('')
   const [visitorPass, setVisitorPass] = useState(null)
   const [visitorQr, setVisitorQr] = useState(null)
   const [visitorQrSeconds, setVisitorQrSeconds] = useState(0)
@@ -112,6 +118,13 @@ function App() {
   }, [securityToken, loadSecurityDashboard])
 
   useEffect(() => {
+    if (!approvalToken) return undefined
+    let active = true
+    request('/api/visitor-approvals/' + encodeURIComponent(approvalToken)).then((data) => { if (active) setHostApproval(data) }).catch((error) => { if (active) setMessage({ type: 'error', text: error.message }) })
+    return () => { active = false }
+  }, [approvalToken])
+
+  useEffect(() => {
     if (!visitorPassId) return undefined
     let active = true
     const refresh = async () => {
@@ -149,12 +162,12 @@ function App() {
     let location = {}
     try { location = await getLocation() } catch { /* gate scans remain available if GPS is blocked */ }
     try {
-      const data = await request('/api/security/scan', { method: 'POST', body: JSON.stringify({ payload, latitude: location.lat, longitude: location.lon }) }, securityToken)
+      const data = await request('/api/security/scan', { method: 'POST', body: JSON.stringify({ payload, latitude: location.lat, longitude: location.lon, identityVerified }) }, securityToken)
       setMessage({ type: 'success', text: `${data.message} ${data.visitor.fullName} · ${data.visitor.purpose}` })
       await loadSecurityDashboard(securityToken)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
-    finally { setBusy(false) }
-  }, [securityToken, loadSecurityDashboard])
+    finally { setBusy(false); setIdentityVerified(false) }
+  }, [securityToken, loadSecurityDashboard, identityVerified])
 
   useEffect(() => {
     if (!scanOn || !videoRef.current) return undefined
@@ -215,8 +228,20 @@ function App() {
     try {
       const data = await request('/api/visitors', { method: 'POST', body: JSON.stringify(visitor) })
       sessionStorage.setItem('campuspass.visitorPass', data.passId)
+      sessionStorage.setItem('campuspass.visitorApproval', data.approvalUrl)
+      setApprovalLink(data.approvalUrl)
       setVisitorPassId(data.passId)
       setMessage({ type: 'success', text: 'Visitor registration complete. Your rotating QR pass is ready.' })
+    } catch (error) { setMessage({ type: 'error', text: error.message }) }
+    finally { setBusy(false) }
+  }
+
+  async function decideVisit(decision) {
+    setBusy(true); setMessage(null)
+    try {
+      const data = await request('/api/visitor-approvals/' + encodeURIComponent(approvalToken), { method: 'POST', body: JSON.stringify({ decision }) })
+      setHostApproval({ ...hostApproval, approvalStatus: data.approvalStatus })
+      setMessage({ type: 'success', text: data.approvalStatus === 'approved' ? 'Visit approved. The guest can now use their pass.' : 'Visit declined.' })
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
   }
@@ -248,10 +273,14 @@ function App() {
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
   }
 
+  const emergencyTerm = emergencySearch.trim().toLowerCase()
+  const filteredStudents = (securityData.presentStudents || []).filter((row) => [row.className, row.teacherName, row.studentId].join(' ').toLowerCase().includes(emergencyTerm))
+  const filteredInside = (securityData.inside || []).filter((row) => [row.fullName, row.organization, row.hostName].join(' ').toLowerCase().includes(emergencyTerm))
+
   const expired = session && remaining === 0
   const switchMode = (nextMode) => { stopCamera(); setMode(nextMode); setMessage(null) }
-  const modeTitle = { teacher: 'Make every class count.', student: 'You’re one scan away.', visitor: 'Welcome to campus.', security: 'A safer campus starts here.' }
-  const modeSubtitle = { teacher: 'Start a secure session and let students check in from the room.', student: 'Scan your class QR code to check in securely.', visitor: 'Register your visit and get your secure, rotating pass.', security: securityToken ? 'Manage campus entry with a live visitor log.' : 'Sign in to scan visitor passes and manage campus entry.' }
+  const modeTitle = { teacher: 'Make every class count.', student: 'You’re one scan away.', visitor: 'Welcome to campus.', security: 'A safer campus starts here.', hostApproval: 'Review a campus visit.' }
+  const modeSubtitle = { teacher: 'Start a secure session and let students check in from the room.', student: 'Scan your class QR code to check in securely.', visitor: 'Register your visit and get your secure, rotating pass.', security: securityToken ? 'Manage campus entry with a live visitor log.' : 'Sign in to scan visitor passes and manage campus entry.', hostApproval: 'Confirm or decline this visitor request.' }
 
   return (
     <div className="app-shell">
@@ -272,6 +301,14 @@ function App() {
         </section>
 
         {message && <div className={`notice ${message.type}`} role="status"><span>{message.type === 'success' ? '✓' : '!'}</span>{message.text}<button aria-label="Dismiss" onClick={() => setMessage(null)}>×</button></div>}
+
+        {mode === 'hostApproval' && <section className="student-layout approval-layout"><div className="card student-card">
+          <div className="card-heading"><span className="step-number">01</span><div><h2>Host approval</h2><p>Review the visitor request before a pass is activated.</p></div></div>
+          {!hostApproval ? <div className="roster-empty">Loading visit request…</div> : <>
+            <div className="approval-details"><h3>{hostApproval.fullName}</h3><p>{hostApproval.organization}</p><div className="pass-detail"><span>MEETING</span><strong>{hostApproval.hostName}</strong><small>{hostApproval.hostDepartment}</small></div><div className="pass-detail"><span>PURPOSE</span><strong>{hostApproval.purpose}</strong></div><div className="pass-detail"><span>STATUS</span><strong>{hostApproval.approvalStatus}</strong></div></div>
+            {hostApproval.approvalStatus === 'pending' ? <div className="approval-actions"><button className="primary-button" disabled={busy} onClick={() => decideVisit('approved')}>Approve visit</button><button className="secondary-button" disabled={busy} onClick={() => decideVisit('denied')}>Decline</button></div> : <div className="location-note"><span>✓</span><div><strong>Request {hostApproval.approvalStatus}</strong><small>This link can only record one decision.</small></div></div>}
+          </>}
+        </div><aside className="card how-card"><div className="eyebrow">CAMPUS ACCESS</div><h2>A pass is issued only after host approval.</h2><p>Once approved, the guest’s QR refreshes every 30 seconds and can be checked at the security gate.</p></aside></section>}
 
         {mode === 'teacher' && <>
           <div className="submode-tabs"><button className={mode === 'teacher' ? 'active' : ''} onClick={() => setMode('teacher')}>Teacher</button><button onClick={() => switchMode('student')}>Student check-in</button></div>
@@ -323,8 +360,8 @@ function App() {
               <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Creating your pass…' : 'Create my visitor pass'}</button>
             </form>
           </div> : <div className="card visitor-pass-card">
-            <div className="pass-status-row"><div><div className="eyebrow">YOUR CAMPUSPASS</div><h2>Visitor pass</h2></div><span className={`status-pill ${visitorPass?.status === 'inside' ? 'inside' : ''}`}>{visitorPass?.status === 'inside' ? 'On campus' : 'Ready for entry'}</span></div>
-            <div className="visitor-pass-content">{visitorQr?.qrCode ? <div className="visitor-qr-wrap"><img src={visitorQr.qrCode} alt="Rotating visitor QR code" /><span>Code refreshes in {visitorQrSeconds}s</span></div> : <div className="qr-placeholder">▦</div>}
+            <div className="pass-status-row"><div><div className="eyebrow">YOUR CAMPUSPASS</div><h2>Visitor pass</h2></div><span className={`status-pill ${visitorPass?.status === 'inside' ? 'inside' : ''}`}>{visitorPass?.approvalStatus === 'pending' ? 'Host approval pending' : visitorPass?.approvalStatus === 'denied' ? 'Request declined' : visitorPass?.status === 'inside' ? 'On campus' : 'Ready for entry'}</span></div>
+            <div className="visitor-pass-content">{visitorQr?.qrCode ? <div className="visitor-qr-wrap"><img src={visitorQr.qrCode} alt="Rotating visitor QR code" /><span>Code refreshes in {visitorQrSeconds}s</span></div> : visitorPass?.approvalStatus === 'pending' ? <div className="approval-pending"><span className="qr-placeholder">◷</span><strong>Waiting for host approval</strong><small>The host must approve before this QR is activated.</small><a href={approvalLink} target="_blank" rel="noreferrer">Open host approval link</a><button className="secondary-button" onClick={() => navigator.clipboard?.writeText(approvalLink)}>Copy approval link</button></div> : visitorPass?.approvalStatus === 'denied' ? <div className="approval-pending"><strong>Visit request declined</strong><small>Contact your host for next steps.</small></div> : <div className="qr-placeholder">▦</div>}
               <div className="visitor-pass-info"><h3>{visitorPass?.fullName || visitor.fullName}</h3><p>{visitorPass?.organization || visitor.organization}</p><div className="pass-detail"><span>MEETING</span><strong>{visitorPass?.hostName || visitor.hostName}</strong><small>{visitorPass?.hostDepartment || visitor.hostDepartment}</small></div><div className="pass-detail"><span>PURPOSE</span><strong>{visitorPass?.purpose || visitor.purpose}</strong></div>{(visitorPass?.vehicleNumber || visitor.vehicleNumber) && <div className="pass-detail"><span>VEHICLE</span><strong>{visitorPass?.vehicleNumber || visitor.vehicleNumber}</strong></div>}<div className="pass-detail"><span>PASS VALID FOR</span><strong>12 hours from registration</strong></div></div>
             </div><div className="privacy-note">Show this live code to campus security at the gate. It refreshes every 30 seconds and cannot be reused for a second scan in the same time slot.</div>
           </div>}
@@ -335,9 +372,16 @@ function App() {
           <div className="card security-login-card"><div className="security-lock">◈</div><div className="eyebrow">CAMPUS SECURITY</div><h2>Security sign in</h2><p>Use your assigned guard account to access visitor check-in.</p><form onSubmit={securityLogin}><label htmlFor="security-user">Username</label><input id="security-user" autoComplete="username" value={login.username} onChange={(e) => setLogin({ ...login, username: e.target.value })} required /><label htmlFor="security-password">Password</label><input id="security-password" type="password" autoComplete="current-password" value={login.password} onChange={(e) => setLogin({ ...login, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in securely'}</button></form><div className="privacy-note">Security accounts are set up by the campus administrator.</div></div>
           <aside className="card how-card"><div className="how-icon">⌖</div><div className="eyebrow">GATE DESK</div><h2>One scan for a clear arrival log.</h2><p>Every scan records the guard, the visitor, and the exact check-in or check-out time.</p><div className="privacy-note">QR codes refresh every 30 seconds to reduce replay.</div></aside>
         </section> : <section className="security-dashboard">
-          <div className="security-dashboard-header"><div><div className="eyebrow">LIVE GATE STATUS</div><h2>Welcome, {guardUsername}</h2><p>Visitor access is refreshing automatically.</p></div><div className="security-actions"><button className="secondary-button" onClick={downloadVisitorLog}>⇩ Export log</button><button className="secondary-button" onClick={securityLogout}>Sign out</button></div></div>
-          <div className="security-stats"><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{securityData.insideCount}</strong><span>Visitors on campus</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{securityData.recentEvents.length}</strong><span>Recent gate scans</span></div></div><div className="card scan-launch-card"><div><strong>Ready for the next visitor?</strong><span>Scan their current rotating pass QR.</span></div><button className="primary-button" onClick={() => { setScanPurpose('visitor'); setScanOn(true) }}>▦ &nbsp; Scan visitor pass</button></div></div>
-          {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><p>Align the visitor's live QR inside the frame. Scanning checks them in or out automatically.</p></div>}
+          <div className="security-dashboard-header"><div><div className="eyebrow">LIVE GATE STATUS</div><h2>Welcome, {guardUsername}</h2><p>Visitor access is refreshing automatically.</p></div><div className="security-actions"><button className="secondary-button" onClick={downloadVisitorLog}>⇩ Export visitor log</button><button className="secondary-button" onClick={() => setShowEmergency((value) => !value)}>Emergency roll call</button><button className="secondary-button" onClick={securityLogout}>Sign out</button></div></div>
+          <div className="security-stats"><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{securityData.insideCount}</strong><span>Visitors on campus</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{securityData.attendanceToday || 0}</strong><span>Attendance today</span></div></div><div className="card stat-card"><span className="stat-icon">↗</span><div><strong>{securityData.visitorsToday || 0}</strong><span>Visitor check-ins today</span></div></div><div className="card stat-card"><span className="stat-icon">!</span><div><strong>{securityData.pendingApprovals || 0}</strong><span>Host approvals pending</span></div></div><div className="card scan-launch-card"><div><strong>Ready for the next visitor?</strong><span>Scan their current rotating pass QR.</span></div><button className="primary-button" onClick={() => { setIdentityVerified(false); setScanPurpose('visitor'); setScanOn(true) }}>▦ &nbsp; Scan visitor pass</button></div></div>
+          {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor to their photo ID</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><p>Confirm the visitor’s photo ID before scanning their live QR pass.</p></div>}
+          {showEmergency && <section className="card emergency-roll-call">
+            <div className="roster-heading"><div><div className="eyebrow">EMERGENCY VIEW</div><h2>Campus roll call</h2><p>Recorded check-ins for today and visitors currently inside.</p></div><button className="secondary-button" onClick={() => window.print()}>Print roll call</button></div>
+            <div className="location-note"><span>!</span><div><strong>{filteredStudents.length} student check-ins · {filteredInside.length} visitors inside</strong><small>Use this as a live record of app check-ins; it does not detect people who have not checked in.</small></div></div>
+            <label className="emergency-search-label" htmlFor="emergency-search">Search roll call</label><input id="emergency-search" value={emergencySearch} onChange={(event) => setEmergencySearch(event.target.value)} placeholder="Student, class, visitor or organization" />
+            <div className="security-panels emergency-panels"><div className="card security-list-card"><div className="eyebrow">STUDENT ATTENDANCE TODAY</div>{filteredStudents.length ? <div className="event-list">{filteredStudents.map((row, index) => <div className="event-row" key={row.className + row.studentId + row.markedAt + index}><span className="event-mark">✓</span><div><strong>{row.studentId}</strong><span>{row.className} · {row.teacherName || 'Faculty'}</span></div><time>{new Date(row.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No matching attendance records.</div>}</div>
+              <div className="card security-list-card"><div className="eyebrow">VISITORS CURRENTLY INSIDE</div>{filteredInside.length ? <div className="visitor-table">{filteredInside.map((row) => <div className="visitor-row" key={row.passId}><div className="visitor-row-avatar">{row.fullName.slice(0, 1).toUpperCase()}</div><div className="visitor-row-main"><strong>{row.fullName}</strong><span>{row.organization} · Host {row.hostName}</span><small>{row.purpose}</small></div><span className="inside-pill">Inside</span></div>)}</div> : <div className="roster-empty">No matching visitors are inside.</div>}</div></div>
+          </section>}
           <div className="security-panels"><div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">CURRENTLY INSIDE</div><h2>On-campus visitors</h2></div><span className="count-pill">{securityData.insideCount} inside</span></div>{securityData.inside.length ? <div className="visitor-table">{securityData.inside.map((person) => <div className="visitor-row" key={person.passId}><div className="visitor-row-avatar">{person.fullName.slice(0, 1).toUpperCase()}</div><div className="visitor-row-main"><strong>{person.fullName}</strong><span>{person.organization} · Meeting {person.hostName}</span><small>{person.purpose}</small></div><div className="visitor-row-side"><strong>{person.vehicleNumber || 'No vehicle'}</strong><span>{person.phone}</span></div><span className="inside-pill">Inside</span></div>)}</div> : <div className="roster-empty">No visitors are currently checked in.</div>}</div>
             <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>Recent gate activity</h2></div><span className="count-pill">Live</span></div>{securityData.recentEvents.length ? <div className="event-list">{securityData.recentEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">Scanned entries and exits will appear here.</div>}</div></div>
         </section>)}
