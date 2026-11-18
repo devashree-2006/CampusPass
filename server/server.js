@@ -245,10 +245,17 @@ app.get("/api/security/dashboard", requireGuard, (req, res) => {
 });
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
   const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
-  const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude"];
+  const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude", "identity_verified"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => escape(row[column])).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=campuspass-visitor-log.csv" }).send(csv);
+});
+app.get("/api/security/attendance.csv", requireGuard, (_req, res) => {
+  const rows = db.prepare("SELECT s.class_name, s.teacher_name, r.student_id, r.marked_at, r.distance FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token ORDER BY r.marked_at DESC").all();
+  const columns = ["class_name", "teacher_name", "student_id", "marked_at", "distance"];
+  const escape = (value) => '"' + String(value ?? "").replaceAll('"', '""') + '"';
+  const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => escape(row[column])).join(","))].join("\r\n");
+  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=campuspass-attendance.csv" }).send(csv);
 });
 app.post("/api/security/scan", requireGuard, (req, res) => {
   const data = parseVisitorQr(req.body.payload);

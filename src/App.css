@@ -242,3 +242,6 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
   .emergency-panels { display: grid !important; grid-template-columns: 1fr 1fr; }
 }
 
+.security-actions { flex-wrap: wrap; }
+.security-actions button { min-width: 112px; }
+

@@ -22,7 +22,7 @@ Phone camera and location access require HTTPS. Use the deployed Render HTTPS ad
 - Students scan from a different phone or paste the current QR text, enter their student ID, and check in once. GPS accuracy is included to account for indoor drift. Teachers see a live roster.
 - Visitors submit their full name, phone, email, organization, vehicle number, host, department, and visit purpose. The host gets a one-use approval link; the rotating pass activates only after approval.
 - Visitor passes rotate every 30 seconds. Guard scans check visitors in or out, reject stale or reused codes, require a photo ID match before check-in, and record the guard, timestamp, ID confirmation, and optional GPS location.
-- Security staff sign in with a provisioned account, see daily attendance and visitor counts, pending approvals, live occupancy, and gate activity, and export the visitor audit log as CSV. The searchable emergency roll call lists today's recorded student check-ins and visitors currently inside, with a print view.
+- Security staff sign in with a provisioned account, see daily attendance and visitor counts, pending approvals, live occupancy, and gate activity, and export visitor and attendance logs as CSV. The searchable emergency roll call lists today's recorded student check-ins and visitors currently inside, with a print view.
 - Visitor details, gate events, attendance sessions, and attendance records are stored in SQLite.
 
 ## Deploy to Render Free
