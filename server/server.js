@@ -58,6 +58,7 @@ const VISITOR_QR_SKEW_SLOTS = 1;
 const VISITOR_VALIDITY_MS = 12 * 60 * 60 * 1000;
 const SECURITY_SESSION_MS = 12 * 60 * 60 * 1000;
 const guardSessions = new Map();
+const teacherSessions = new Map();
 const loginAttempts = new Map();
 
 let qrSecret = db.prepare("SELECT value FROM settings WHERE key = 'visitor_qr_secret'").get()?.value;
@@ -120,14 +121,40 @@ function requireGuard(req, res, next) {
   }
   req.guard = session; next();
 }
+function requireTeacher(req, res, next) {
+  const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const session = token && teacherSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) teacherSessions.delete(token);
+    return jsonError(res, 401, "Teacher login expired. Please sign in again.");
+  }
+  req.teacher = session; next();
+}
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, database: "sqlite", time: new Date().toISOString() }));
-app.post("/api/attendance/start", async (req, res) => {
+app.post("/api/teacher/login", (req, res) => {
+  const now = Date.now(); const ip = req.ip || "unknown";
+  const attempts = loginAttempts.get(`teacher:${ip}`) || { count: 0, resetAt: now + 15 * 60 * 1000 };
+  if (attempts.resetAt < now) { attempts.count = 0; attempts.resetAt = now + 15 * 60 * 1000; }
+  if (attempts.count >= 8) return jsonError(res, 429, "Too many login attempts. Please wait 15 minutes.");
+  const username = cleanText(req.body.username, 80); const password = typeof req.body.password === "string" ? req.body.password : "";
+  const expectedUsername = process.env.TEACHER_USERNAME || "";
+  const expectedPassword = process.env.TEACHER_PASSWORD || "";
+  const matches = username === expectedUsername && password.length === expectedPassword.length && timingSafeEqual(Buffer.from(password), Buffer.from(expectedPassword));
+  if (!matches) { attempts.count += 1; loginAttempts.set(`teacher:${ip}`, attempts); return jsonError(res, 401, "Username or password is incorrect."); }
+  loginAttempts.delete(`teacher:${ip}`); const token = randomBytes(32).toString("base64url");
+  teacherSessions.set(token, { username, expiresAt: now + SECURITY_SESSION_MS });
+  res.json({ token, username, expiresAt: now + SECURITY_SESSION_MS });
+});
+app.post("/api/teacher/logout", requireTeacher, (req, res) => {
+  const token = req.get("authorization").replace(/^Bearer\s+/i, ""); teacherSessions.delete(token); res.json({ success: true });
+});
+app.post("/api/attendance/start", requireTeacher, async (req, res) => {
   const { teacherLat, teacherLon } = req.body;
   if (!Number.isFinite(teacherLat) || !Number.isFinite(teacherLon) || Math.abs(teacherLat) > 90 || Math.abs(teacherLon) > 180) return jsonError(res, 400, "Valid teacher location is required.");
   try {
     const token = randomUUID(); const expiresAt = Date.now() + ATTENDANCE_QR_VALIDITY;
-    const teacherName = cleanText(req.body.teacherName, 80); const className = cleanText(req.body.className, 100);
+    const teacherName = req.teacher.username; const className = cleanText(req.body.className, 100);
     const teacherAccuracy = clampAccuracy(req.body.teacherAccuracy);
     db.prepare(`INSERT INTO attendance_sessions(token, teacher_name, class_name, teacher_lat, teacher_lon, teacher_accuracy, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(token, teacherName, className, teacherLat, teacherLon, teacherAccuracy, expiresAt, new Date().toISOString());
@@ -160,11 +187,20 @@ app.post("/api/attendance/verify", (req, res) => {
     res.json({ success: true, message: "Attendance marked successfully!", distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance) });
   } catch { jsonError(res, 409, "Attendance already marked for this student."); }
 });
-app.get("/api/attendance/:token/records", (req, res) => {
+app.get("/api/attendance/:token/records", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
   const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
   res.json({ records, expiresAt: session.expires_at });
+});
+app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
+  const session = db.prepare("SELECT token, teacher_name, class_name, created_at, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
+  if (!session) return jsonError(res, 404, "Attendance session not found.");
+  const rows = db.prepare("SELECT student_id, marked_at, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
+  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "marked_at", "distance_metres"];
+  const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const csv = [columns.join(","), ...rows.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
+  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${session.class_name.replace(/[^a-z0-9]+/gi, "-")}-attendance.csv` }).send(csv);
 });
 
 app.post("/api/visitors", (req, res) => {
@@ -182,24 +218,7 @@ app.post("/api/visitors", (req, res) => {
   db.prepare(`INSERT INTO visitors(pass_id, full_name, phone, email, organization, host_name, host_department, purpose, vehicle_number, valid_from, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(passId, visitor.fullName, visitor.phone, visitor.email, visitor.organization, visitor.hostName, visitor.hostDepartment, visitor.purpose, visitor.vehicleNumber, now, validUntil, new Date(now).toISOString());
   db.prepare("INSERT INTO visitor_approvals(pass_id, token_hash, status, created_at) VALUES (?, ?, 'pending', ?)").run(passId, tokenHash, new Date(now).toISOString());
-  const approvalUrl = req.protocol + "://" + req.get("host") + "/?approve=" + encodeURIComponent(approvalToken);
-  res.status(201).json({ passId, visitor, validUntil, approvalUrl });
-});
-app.get("/api/visitor-approvals/:token", (req, res) => {
-  const tokenHash = createHash("sha256").update(req.params.token).digest("hex");
-  const approval = db.prepare("SELECT a.status AS approvalStatus, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.valid_until AS validUntil FROM visitor_approvals a JOIN visitors v ON v.pass_id = a.pass_id WHERE a.token_hash = ?").get(tokenHash);
-  if (!approval) return jsonError(res, 404, "This host approval link is invalid.");
-  res.set("Cache-Control", "no-store"); res.json(approval);
-});
-app.post("/api/visitor-approvals/:token", (req, res) => {
-  const decision = req.body.decision;
-  if (!["approved", "denied"].includes(decision)) return jsonError(res, 400, "Choose approve or decline.");
-  const tokenHash = createHash("sha256").update(req.params.token).digest("hex");
-  const approval = db.prepare("SELECT pass_id, status FROM visitor_approvals WHERE token_hash = ?").get(tokenHash);
-  if (!approval) return jsonError(res, 404, "This host approval link is invalid.");
-  if (approval.status !== "pending") return jsonError(res, 409, "This visit has already been decided.");
-  db.prepare("UPDATE visitor_approvals SET status = ?, decided_at = ? WHERE pass_id = ? AND status = 'pending'").run(decision, new Date().toISOString(), approval.pass_id);
-  res.json({ approvalStatus: decision });
+  res.status(201).json({ passId, visitor, validUntil });
 });
 app.get("/api/visitors/:passId/qr", async (req, res) => {
   const visitor = db.prepare("SELECT pass_id, full_name, host_name, host_department, purpose, organization, vehicle_number, status, valid_from, valid_until, (SELECT status FROM visitor_approvals WHERE pass_id = visitors.pass_id) AS approval_status FROM visitors WHERE pass_id = ?").get(req.params.passId);
@@ -240,8 +259,16 @@ app.get("/api/security/dashboard", requireGuard, (req, res) => {
   const visitorsToday = db.prepare("SELECT COUNT(*) AS count FROM visitor_events WHERE scanned_at >= ? AND event_type = 'CHECK_IN'").get(todayIso).count;
   const attendanceToday = db.prepare("SELECT COUNT(*) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
   const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
+  const approvalQueue = db.prepare(`SELECT v.pass_id AS passId, v.full_name AS fullName, v.phone, v.email, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.vehicle_number AS vehicleNumber, v.created_at AS createdAt, v.valid_until AS validUntil FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE a.status = 'pending' ORDER BY v.created_at`).all();
   const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
-  res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, presentStudents });
+  res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, approvalQueue, presentStudents });
+});
+app.post("/api/security/visitor-approvals/:passId", requireGuard, (req, res) => {
+  const decision = req.body.decision;
+  if (!["approved", "denied"].includes(decision)) return jsonError(res, 400, "Choose approve or decline.");
+  const result = db.prepare("UPDATE visitor_approvals SET status = ?, decided_at = ? WHERE pass_id = ? AND status = 'pending'").run(decision, new Date().toISOString(), req.params.passId);
+  if (!result.changes) return jsonError(res, 409, "This visitor request has already been decided or no longer exists.");
+  res.json({ approvalStatus: decision });
 });
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
   const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();

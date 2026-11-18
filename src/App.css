@@ -188,6 +188,18 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .security-camera-card .camera-box { max-width: 500px; margin: 0 auto; }
 .security-camera-card > p { margin: 10px 0 2px; color: #85938a; text-align: center; font-size: 10px; }
 .security-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.teacher-header { margin-top: 3px; }
+.teacher-login-layout { max-width: 870px; }
+.session-export-button { display: block; width: 100%; margin-top: 16px; }
+.approval-queue { margin: 0 0 16px; }
+.approval-queue-list { display: grid; gap: 10px; margin-top: 15px; }
+.approval-request { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid #e8eee9; border-radius: 11px; background: #fbfdfb; }
+.approval-request > div:first-child { min-width: 0; }
+.approval-request strong, .approval-request span, .approval-request small { display: block; }
+.approval-request strong { color: #315140; font-size: 12px; }
+.approval-request span, .approval-request small { margin-top: 4px; color: #839087; font-size: 10px; }
+.approval-request .approval-actions { flex: 0 0 190px; margin: 0; }
+.exit-hint { margin: 8px 0 0; color: #839087; font-size: 10px; line-height: 1.5; }
 .security-list-card { min-width: 0; padding: 20px; }
 .visitor-table, .event-list { margin-top: 13px; }
 .visitor-row { display: grid; grid-template-columns: 31px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 12px 0; border-top: 1px solid #eff2ef; }
@@ -214,6 +226,8 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
   .security-stats { grid-template-columns: 1fr 1fr; }
   .scan-launch-card { grid-column: 1 / -1; }
   .security-dashboard-header { align-items: flex-start; gap: 14px; flex-direction: column; }
+  .approval-request { align-items: stretch; flex-direction: column; }
+  .approval-request .approval-actions { flex-basis: auto; }
   .visitor-row { grid-template-columns: 31px minmax(0,1fr) auto; }
   .visitor-row-side { display: none; }
 }
