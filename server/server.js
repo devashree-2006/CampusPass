@@ -306,7 +306,7 @@ app.get("/api/security/dashboard", requireGuard, (req, res) => {
   const attendanceToday = db.prepare("SELECT COUNT(*) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
   const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
   const approvalQueue = db.prepare(`SELECT v.pass_id AS passId, v.full_name AS fullName, v.phone, v.email, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.vehicle_number AS vehicleNumber, v.created_at AS createdAt, v.valid_until AS validUntil FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE a.status = 'pending' ORDER BY v.created_at`).all();
-  const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt, r.submitted_by AS submittedBy, r.group_size AS groupSize FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
+  const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
   res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, approvalQueue, presentStudents });
 });
 app.post("/api/security/visitor-approvals/:passId", requireGuard, (req, res) => {
