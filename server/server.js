@@ -185,7 +185,8 @@ app.post("/api/attendance/start", requireTeacher, async (req, res) => {
   if (!Number.isFinite(teacherLat) || !Number.isFinite(teacherLon) || Math.abs(teacherLat) > 90 || Math.abs(teacherLon) > 180) return jsonError(res, 400, "Valid teacher location is required.");
   try {
     const token = randomUUID(); const expiresAt = Date.now() + ATTENDANCE_QR_VALIDITY;
-    const teacherName = req.teacher.username; const className = cleanText(req.body.className, 100);
+    const teacherName = cleanText(req.body.teacherName, 100); const className = cleanText(req.body.className, 100);
+    if (!teacherName || !className) return jsonError(res, 400, "Enter the teacher name and class before starting attendance.");
     const teacherAccuracy = clampAccuracy(req.body.teacherAccuracy);
     db.prepare(`INSERT INTO attendance_sessions(token, teacher_name, class_name, teacher_lat, teacher_lon, teacher_accuracy, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(token, teacherName, className, teacherLat, teacherLon, teacherAccuracy, expiresAt, new Date().toISOString());
@@ -247,6 +248,49 @@ app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const csv = [columns.join(","), ...rows.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${session.class_name.replace(/[^a-z0-9]+/gi, "-")}-attendance.csv` }).send(csv);
+});
+function buildTeacherAttendanceReport(teacherName, className, days) {
+  const since = new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString();
+  const sessions = db.prepare(`SELECT s.token, s.teacher_name AS teacherName, s.class_name AS className, s.created_at AS createdAt,
+    (SELECT COUNT(*) FROM attendance_records r WHERE r.session_token = s.token) AS attendanceCount
+    FROM attendance_sessions s WHERE s.teacher_name = ? COLLATE NOCASE AND s.class_name = ? COLLATE NOCASE AND s.created_at >= ?
+    ORDER BY s.created_at`).all(teacherName, className, since);
+  const records = sessions.length ? db.prepare(`SELECT session_token AS sessionToken, student_id AS studentId FROM attendance_records
+    WHERE session_token IN (${sessions.map(() => "?").join(",")}) ORDER BY student_id`).all(...sessions.map((row) => row.token)) : [];
+  const attendanceByStudent = new Map();
+  for (const record of records) {
+    if (!attendanceByStudent.has(record.studentId)) attendanceByStudent.set(record.studentId, new Set());
+    attendanceByStudent.get(record.studentId).add(record.sessionToken);
+  }
+  const students = [...attendanceByStudent.entries()].map(([studentId, attended]) => ({
+    studentId,
+    attendedSessions: attended.size,
+    totalSessions: sessions.length,
+    percentage: sessions.length ? Math.round(attended.size / sessions.length * 100) : 0,
+    attendance: sessions.map((session) => attended.has(session.token)),
+  })).sort((a, b) => a.studentId.localeCompare(b.studentId));
+  return { teacherName, className, days, since, totalSessions: sessions.length, totalCheckIns: records.length, sessions, students };
+}
+function readTeacherReportFilters(req, res) {
+  const teacherName = cleanText(req.query.teacherName, 100); const className = cleanText(req.query.className, 100);
+  const requestedDays = Number.parseInt(req.query.days || "15", 10); const days = Number.isFinite(requestedDays) ? Math.min(30, Math.max(1, requestedDays)) : 15;
+  if (!teacherName || !className) { jsonError(res, 400, "Enter the teacher name and class to load attendance history."); return null; }
+  return { teacherName, className, days };
+}
+app.get("/api/teacher/attendance-summary", requireTeacher, (req, res) => {
+  const filters = readTeacherReportFilters(req, res); if (!filters) return;
+  res.json(buildTeacherAttendanceReport(filters.teacherName, filters.className, filters.days));
+});
+app.get("/api/teacher/attendance-range.csv", requireTeacher, (req, res) => {
+  const filters = readTeacherReportFilters(req, res); if (!filters) return;
+  const report = buildTeacherAttendanceReport(filters.teacherName, filters.className, filters.days);
+  const sessions = report.sessions;
+  const columns = ["student_id", "classes_held", "classes_attended", "attendance_percentage", ...sessions.map((row, index) => `session_${index + 1}_${row.createdAt.slice(0, 10)}`)];
+  const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const rows = report.students.map((student) => [student.studentId, report.totalSessions, student.attendedSessions, student.percentage, ...student.attendance.map((present) => present ? "Present" : "Absent")].map(escape).join(","));
+  const csv = [columns.join(","), ...rows].join("\r\n");
+  const safeClass = filters.className.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");
+  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${safeClass}-${filters.days}-day-attendance.csv` }).send(csv);
 });
 
 app.post("/api/visitors", (req, res) => {

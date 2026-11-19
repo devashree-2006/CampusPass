@@ -224,6 +224,32 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .event-row em { color: #829188; font-style: normal; font-weight: 500; }
 .event-row span { margin-top: 3px; color: #99a39c; font-size: 9px; }
 .event-row time { color: #8d9a91; font-size: 9px; }
+.camera-zoom-control { display: flex; align-items: center; gap: 12px; margin: 10px 2px 0; color: #5a6d60; font-size: 11px; font-weight: 700; }
+.camera-zoom-control span { min-width: 38px; color: #267653; text-align: right; font-variant-numeric: tabular-nums; }
+.camera-zoom-control input { flex: 1; height: 24px; padding: 0; accent-color: #126346; }
+.camera-zoom-note { margin-top: 9px; color: #8c9990; text-align: center; font-size: 10px; }
+.attendance-history-card { margin-top: 16px; padding: 22px 25px; }
+.attendance-history-card .roster-heading { align-items: flex-start; gap: 16px; }
+.attendance-history-card .roster-heading p { margin-top: 6px; color: #849189; font-size: 11px; line-height: 1.5; }
+.history-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 9px; margin-top: 18px; }
+.history-controls label { min-width: 145px; color: #56685c; font-size: 10px; font-weight: 700; }
+.history-controls select { display: block; width: 100%; margin-top: 6px; padding: 10px; border: 1px solid #e1e7e2; border-radius: 8px; background: #fcfdfc; color: #43584a; }
+.history-controls .secondary-button, .history-controls .primary-button { width: auto; min-height: 38px; padding: 9px 13px; }
+.history-summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px 10px; margin: 18px 0 10px; color: #839087; font-size: 11px; }
+.history-summary strong { color: #247451; font: 800 19px Manrope, sans-serif; }
+.history-summary strong:nth-of-type(2) { margin-left: 14px; }
+.history-table-wrap { overflow-x: auto; border: 1px solid #edf1ed; border-radius: 9px; }
+.history-table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: left; }
+.history-table th, .history-table td { padding: 11px 13px; border-bottom: 1px solid #edf1ed; white-space: nowrap; }
+.history-table th { background: #f8faf8; color: #819087; font-size: 9px; letter-spacing: .5px; text-transform: uppercase; }
+.history-table td { color: #526458; }
+.history-table tr:last-child td { border-bottom: 0; }
+.attendance-rate { padding: 4px 7px; border-radius: 20px; background: #eaf5ee; color: #287653; font-weight: 800; }
+.attendance-rate.low { background: #fff1e8; color: #a7603d; }
+.history-session-list { display: grid; gap: 7px; margin-top: 16px; color: #819087; font-size: 10px; }
+.history-session-list strong { margin-bottom: 2px; color: #526458; font-size: 11px; }
+.history-session-list span { padding-left: 10px; border-left: 2px solid #dbece1; }
+.history-share-note { margin-top: 14px; padding: 10px 12px; border-radius: 8px; background: #f5f9f6; color: #7b8b80; font-size: 10px; line-height: 1.5; }
 @media (max-width: 760px) {
   .visitor-layout, .security-login-layout, .security-panels { grid-template-columns: 1fr; }
   .visitor-form-card, .visitor-pass-card, .security-login-card, .security-list-card { padding: 21px; }
@@ -235,6 +261,9 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
   .approval-request { align-items: stretch; flex-direction: column; }
   .approval-request .approval-actions { flex-basis: auto; }
   .admin-stats { grid-template-columns: 1fr 1fr; }
+  .history-controls { align-items: stretch; }
+  .history-controls label, .history-controls .secondary-button, .history-controls .primary-button { width: 100%; }
+  .attendance-history-card { padding: 20px; }
   .visitor-row { grid-template-columns: 31px minmax(0,1fr) auto; }
   .visitor-row-side { display: none; }
 }

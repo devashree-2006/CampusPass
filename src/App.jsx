@@ -3,6 +3,11 @@ import './App.css'
 
 const API = import.meta.env.VITE_API_URL || ''
 
+function CameraZoomControl({ range, value, onChange }) {
+  if (!range) return <div className="camera-zoom-note">Hardware zoom is unavailable on this camera.</div>
+  return <label className="camera-zoom-control">Camera zoom <span>{Number(value).toFixed(1)}×</span><input aria-label="Camera zoom" type="range" min={range.min} max={range.max} step={range.step} value={value} onChange={(event) => onChange(event.target.value)} /></label>
+}
+
 function getAttendanceDeviceId() {
   const key = 'campuspass.attendanceDeviceId'
   let id = localStorage.getItem(key)
@@ -13,6 +18,8 @@ function getAttendanceDeviceId() {
   }
   return id
 }
+
+const videoTrackFilter = (track) => track.kind === 'video'
 
 async function request(path, options = {}, authToken = '') {
   const response = await fetch(`${API}${path}`, {
@@ -38,6 +45,12 @@ function getLocation() {
 function App() {
   const [mode, setMode] = useState('teacher')
   const [className, setClassName] = useState('')
+  const [teacherName, setTeacherName] = useState(() => sessionStorage.getItem('campuspass.teacherDisplayName') || '')
+  const [historyDays, setHistoryDays] = useState(15)
+  const [historyReport, setHistoryReport] = useState(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [cameraZoom, setCameraZoom] = useState(1)
+  const [cameraZoomRange, setCameraZoomRange] = useState(null)
   const [teacherToken, setTeacherToken] = useState(() => sessionStorage.getItem('campuspass.teacherToken') || '')
   const [teacherUsername, setTeacherUsername] = useState(() => sessionStorage.getItem('campuspass.teacherName') || '')
   const [teacherLoginForm, setTeacherLoginForm] = useState({ username: '', password: '' })
@@ -176,6 +189,7 @@ function App() {
   const stopCamera = useCallback(() => {
     scannerRef.current?.stop()
     scannerRef.current = null
+    setCameraZoomRange(null)
     streamRef.current?.getTracks().forEach((track) => track.stop())
     videoRef.current?.srcObject?.getTracks?.().forEach((track) => track.stop())
     streamRef.current = null
@@ -201,11 +215,14 @@ function App() {
     let active = true
     const start = async () => {
       try {
+        setCameraZoomRange(null)
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access requires HTTPS.')
-        const { BrowserCodeReader, BrowserQRCodeReader } = await import('@zxing/browser')
-        await BrowserCodeReader.listVideoInputDevices()
-        const reader = new BrowserQRCodeReader()
-        const controls = await reader.decodeFromVideoDevice(undefined, videoRef.current, (result) => {
+        const { BrowserQRCodeReader } = await import('@zxing/browser')
+        const reader = new BrowserQRCodeReader(undefined, { delayBetweenScanAttempts: 90, delayBetweenScanSuccess: 180 })
+        const controls = await reader.decodeFromConstraints({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30, max: 30 }, advanced: [{ focusMode: 'continuous' }] },
+        }, videoRef.current, (result) => {
           if (!result || !active) return
           const rawValue = result.getText()
           if (scanPurpose === 'visitor') void scanVisitorQr(rawValue)
@@ -216,7 +233,17 @@ function App() {
           stopCamera()
         })
         if (!active) controls.stop()
-        else scannerRef.current = controls
+        else {
+          scannerRef.current = controls
+          const capabilities = controls.streamVideoCapabilitiesGet?.(videoTrackFilter)
+          const settings = controls.streamVideoSettingsGet?.(videoTrackFilter)
+          const zoom = capabilities?.zoom
+          if (zoom && Number.isFinite(zoom.min) && Number.isFinite(zoom.max) && zoom.max > zoom.min) {
+            const current = settings?.zoom || zoom.min
+            setCameraZoomRange({ min: zoom.min, max: zoom.max, step: zoom.step || 0.1 })
+            setCameraZoom(current)
+          } else setCameraZoomRange(null)
+        }
       } catch {
         setMessage({ type: 'error', text: 'Could not open the camera. Use HTTPS, allow camera access, or paste the QR code text.' })
         stopCamera()
@@ -226,12 +253,19 @@ function App() {
     return () => { active = false; scannerRef.current?.stop(); scannerRef.current = null }
   }, [scanOn, scanPurpose, stopCamera, scanVisitorQr])
 
+  function applyCameraZoom(value) {
+    const zoom = Number(value)
+    try { scannerRef.current?.streamVideoConstraintsApply?.({ advanced: [{ zoom }] }, videoTrackFilter) } catch { /* zoom is optional on this camera */ }
+    setCameraZoom(zoom)
+  }
+
   async function startAttendance(event) {
     event.preventDefault(); setBusy(true); setMessage(null)
     try {
       const location = await getLocation()
-      const data = await request('/api/attendance/start', { method: 'POST', body: JSON.stringify({ teacherLat: location.lat, teacherLon: location.lon, teacherAccuracy: location.accuracy, className: className.trim() }) }, teacherToken)
+      const data = await request('/api/attendance/start', { method: 'POST', body: JSON.stringify({ teacherName: teacherName.trim(), teacherLat: location.lat, teacherLon: location.lon, teacherAccuracy: location.accuracy, className: className.trim() }) }, teacherToken)
       setSession(data); setAttendees([]); setAttendanceQr(null)
+      sessionStorage.setItem('campuspass.teacherDisplayName', teacherName.trim())
       setMessage({ type: 'success', text: 'Attendance is open. Students can scan this QR code now.' })
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
@@ -279,6 +313,39 @@ function App() {
       const url = URL.createObjectURL(await response.blob())
       const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'campuspass-session-attendance.csv'; anchor.click(); URL.revokeObjectURL(url)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
+  }
+
+  function attendanceHistoryPath() {
+    const query = new URLSearchParams({ teacherName: teacherName.trim(), className: className.trim(), days: String(historyDays) })
+    return `/api/teacher/attendance-range.csv?${query.toString()}`
+  }
+
+  async function loadAttendanceHistory() {
+    if (!teacherName.trim() || !className.trim()) {
+      setMessage({ type: 'error', text: 'Enter your teacher name and class to view attendance history.' })
+      return
+    }
+    setHistoryLoading(true); setMessage(null)
+    try {
+      const query = new URLSearchParams({ teacherName: teacherName.trim(), className: className.trim(), days: String(historyDays) })
+      setHistoryReport(await request(`/api/teacher/attendance-summary?${query.toString()}`, {}, teacherToken))
+    } catch (error) { setMessage({ type: 'error', text: error.message }) }
+    finally { setHistoryLoading(false) }
+  }
+
+  async function downloadAttendanceHistory(share = false) {
+    try {
+      const response = await fetch(`${API}${attendanceHistoryPath()}`, { headers: { Authorization: `Bearer ${teacherToken}` } })
+      if (!response.ok) throw new Error('Could not download this attendance report.')
+      const file = new File([await response.blob()], `campuspass-${className.trim().replace(/[^a-z0-9]+/gi, '-')}-${historyDays}-day-attendance.csv`, { type: 'text/csv' })
+      if (share && navigator.share && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: `${className} attendance`, text: `${teacherName} · ${className} · last ${historyDays} days` })
+      } else {
+        const url = URL.createObjectURL(file)
+        const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.name; anchor.click(); URL.revokeObjectURL(url)
+        if (share) setMessage({ type: 'success', text: 'Report downloaded. Attach the CSV to your parents’ group from your messaging app.' })
+      }
+    } catch (error) { if (error.name !== 'AbortError') setMessage({ type: 'error', text: error.message }) }
   }
 
   async function markAttendance(event) {
@@ -389,7 +456,8 @@ function App() {
           <section className="teacher-grid">
             <div className="card setup-card">
               <div className="card-heading"><span className="step-number">01</span><div><h2>Set up your session</h2><p>Share a few details to get started.</p></div></div>
-              <form onSubmit={startAttendance}>
+            <form onSubmit={startAttendance}>
+                <label htmlFor="teacher-display-name">Teacher name</label><input id="teacher-display-name" value={teacherName} onChange={(e) => setTeacherName(e.target.value)} placeholder="e.g. Dr. Sharma" autoComplete="name" maxLength={100} required />
                 <label htmlFor="class-name">Class or subject</label><input id="class-name" value={className} onChange={(e) => setClassName(e.target.value)} placeholder="e.g. Biology · Room 204" required />
                 <div className="location-note"><span>◎</span><div><strong>Your location anchors this session</strong><small>GPS accuracy is included in the 50 metre check.</small></div></div>
                 <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Getting your location…' : '↗  Start attendance'}</button>
@@ -409,13 +477,18 @@ function App() {
               {attendees.length ? <div className="roster-list">{attendees.map((person) => <div className="roster-person" key={person.studentId}><span className="avatar">{person.studentId.slice(0, 1).toUpperCase()}</span><strong>{person.studentId}</strong><span>{new Date(person.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span><b>✓</b></div>)}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in…' : 'Your student check-ins will appear here.'}</div>}
             </div>
           </section>
+          <section className="card attendance-history-card">
+            <div className="roster-heading"><div><div className="eyebrow">CLASS ATTENDANCE HISTORY</div><h2>{teacherName.trim() && className.trim() ? `${className} · ${teacherName}` : 'Review attendance across sessions'}</h2><p>See how many classes each student attended and share a dated CSV report.</p></div><span className="count-pill">{historyReport ? `${historyReport.totalSessions} sessions` : '15 days'}</span></div>
+            <div className="history-controls"><label htmlFor="history-days">Period<select id="history-days" value={historyDays} onChange={(e) => { setHistoryDays(Number(e.target.value)); setHistoryReport(null) }}><option value={15}>Last 15 days</option><option value={30}>Last 30 days</option></select></label><button className="secondary-button" onClick={loadAttendanceHistory} disabled={historyLoading}>{historyLoading ? 'Loading…' : 'Load class history'}</button>{historyReport && <><button className="secondary-button" onClick={() => downloadAttendanceHistory(false)}>⇩ Download CSV</button><button className="primary-button" onClick={() => downloadAttendanceHistory(true)}>↗ Share with parents</button></>}</div>
+            {historyReport ? <><div className="history-summary"><strong>{historyReport.totalSessions}</strong><span>class sessions held</span><strong>{historyReport.students.length}</strong><span>students recorded</span></div>{historyReport.students.length ? <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Attendance</th></tr></thead><tbody>{historyReport.students.map((student) => <tr key={student.studentId}><td>{student.studentId}</td><td>{student.attendedSessions} / {student.totalSessions}</td><td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td></tr>)}</tbody></table></div> : <div className="roster-empty">No student check-ins were recorded for this class and period.</div>}<div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.map((item, index) => <span key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins</span>)}</div><div className="history-share-note">Share opens your phone’s share menu when supported. Choose the parents’ WhatsApp group to forward the CSV.</div></> : <div className="roster-empty">Enter a teacher name and class above, then load the last 15 days of attendance.</div>}
+          </section>
           </> : <section className="security-login-layout teacher-login-layout"><div className="card security-login-card"><div className="security-lock">✳</div><div className="eyebrow">FACULTY ACCESS</div><h2>Teacher sign in</h2><p>Sign in to start a class session and download its attendance roster.</p><form onSubmit={teacherLogin}><label htmlFor="teacher-user">Username</label><input id="teacher-user" autoComplete="username" value={teacherLoginForm.username} onChange={(e) => setTeacherLoginForm({ ...teacherLoginForm, username: e.target.value })} required /><label htmlFor="teacher-password">Password</label><input id="teacher-password" type="password" autoComplete="current-password" value={teacherLoginForm.password} onChange={(e) => setTeacherLoginForm({ ...teacherLoginForm, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in as teacher'}</button></form></div><aside className="card how-card"><div className="eyebrow">FIVE MINUTE SESSION</div><h2>One class, one attendance file.</h2><p>Every valid student check-in during the session appears together in the teacher’s downloadable roster.</p></aside></section>}
         </>}
 
         {mode === 'student' && <section className="student-layout">
           <div className="card student-card">
             <div className="card-heading"><span className="step-number">01</span><div><h2>Scan your class QR</h2><p>Point your camera at the code shown by your teacher.</p></div></div>
-            {scanOn && scanPurpose === 'attendance' ? <div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close camera</button></div> : <button type="button" className="scan-button" onClick={() => { setMessage(null); setScanPurpose('attendance'); setScanOn(true) }}><span className="scan-symbol">▦</span><span><strong>Open camera to scan</strong><small>Allow camera access when prompted</small></span><b>→</b></button>}
+            {scanOn && scanPurpose === 'attendance' ? <><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close camera</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /></> : <button type="button" className="scan-button" onClick={() => { setMessage(null); setScanPurpose('attendance'); setScanOn(true) }}><span className="scan-symbol">▦</span><span><strong>Open camera to scan</strong><small>Fast QR scanning · back camera preferred</small></span><b>→</b></button>}
             <div className="or-divider"><span /> or enter QR code <span /></div>
             <form onSubmit={markAttendance}><label htmlFor="qr-code">QR code text</label><textarea id="qr-code" rows="2" value={qrInput} onChange={(e) => setQrInput(e.target.value)} placeholder="Paste the code text here" /><label htmlFor="student-id">Your student ID</label><input id="student-id" value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. STU2024012" required /><div className="location-note"><span>◎</span><div><strong>One student ID per device, per session</strong><small>This browser is linked to the first student ID it submits for a class session. Use your own ID and device.</small></div></div><button className="primary-button" type="submit" disabled={busy || !studentId.trim()}>{busy ? 'Checking location…' : '✓  Mark my attendance'}</button></form>
           </div>
@@ -450,7 +523,7 @@ function App() {
           <div className="security-dashboard-header"><div><div className="eyebrow">LIVE GATE STATUS</div><h2>Welcome, {guardUsername}</h2><p>Visitor access is refreshing automatically.</p></div><div className="security-actions"><button className="secondary-button" onClick={() => loadSecurityDashboard(securityToken)}>Refresh requests</button><button className="secondary-button" onClick={downloadVisitorLog}>⇩ Visitor CSV</button><button className="secondary-button" onClick={downloadAttendanceLog}>⇩ Attendance CSV</button><button className="secondary-button" onClick={() => setShowEmergency((value) => !value)}>Emergency roll call</button><button className="secondary-button" onClick={securityLogout}>Sign out</button></div></div>
           {securityLoadError && <div className="notice error" role="alert"><span>!</span>{securityLoadError}</div>}
           <div className="security-stats"><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{securityData.insideCount}</strong><span>Visitors on campus</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{securityData.attendanceToday || 0}</strong><span>Attendance today</span></div></div><div className="card stat-card"><span className="stat-icon">↗</span><div><strong>{securityData.visitorsToday || 0}</strong><span>Visitor check-ins today</span></div></div><div className="card stat-card"><span className="stat-icon">!</span><div><strong>{securityData.pendingApprovals || 0}</strong><span>Security approvals pending</span></div></div><div className="card scan-launch-card"><div><strong>Gate check-in and exit</strong><span>Scan on arrival; scan again when leaving.</span></div><button className="primary-button" onClick={() => { setIdentityVerified(false); setScanPurpose('visitor'); setScanOn(true) }}>▦ &nbsp; Scan entry or exit</button></div></div>
-          {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor’s photo ID for entry</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><p>Entry: confirm the photo ID before scanning. Exit: scan the visitor’s refreshed QR code again.</p></div>}
+          {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor’s photo ID for entry</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /><p>Entry: confirm the photo ID before scanning. Exit: scan the visitor’s refreshed QR code again.</p></div>}
           <div className="card security-list-card approval-queue"><div className="roster-heading"><div><div className="eyebrow">VISITOR ACCESS</div><h2>Requests awaiting security approval</h2><p>Review visitor details before activating a pass.</p></div><span className="count-pill">{securityData.approvalQueue?.length || 0} pending</span></div>{securityData.approvalQueue?.length ? <div className="approval-queue-list">{securityData.approvalQueue.map((person) => <article className="approval-request" key={person.passId}><div><strong>{person.fullName}</strong><span>{person.organization} · {person.phone} · {person.email}</span><small>Meeting {person.hostName} · {person.hostDepartment}</small><small>{person.purpose}{person.vehicleNumber ? ` · Vehicle ${person.vehicleNumber}` : ''}</small></div><div className="approval-actions"><button className="primary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'approved')}>Approve</button><button className="secondary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'denied')}>Decline</button></div></article>)}</div> : <div className="roster-empty">No visitor requests are waiting for security approval.</div>}</div>
           {showEmergency && <section className="card emergency-roll-call">
             <div className="roster-heading"><div><div className="eyebrow">EMERGENCY VIEW</div><h2>Campus roll call</h2><p>Recorded check-ins for today and visitors currently inside.</p></div><button className="secondary-button" onClick={() => window.print()}>Print roll call</button></div>
