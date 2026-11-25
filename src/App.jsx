@@ -78,6 +78,7 @@ function App() {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const scannerRef = useRef(null)
+  const emergencyControlsRef = useRef(null)
 
   const [visitor, setVisitor] = useState({ fullName: '', phone: '', email: '', organization: '', hostName: '', hostDepartment: '', purpose: '', vehicleNumber: '' })
   const [visitorPassId, setVisitorPassId] = useState(() => sessionStorage.getItem('campuspass.visitorPass') || '')
@@ -135,6 +136,13 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
       setEmergencyActionMessage(error.message)
     }
   }, [])
+
+  function openEmergencyControls() {
+    setShowEmergency(true)
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      emergencyControlsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }))
+  }
 
   const activateEmergency = async () => {
     setEmergencyActionBusy(true)
@@ -622,7 +630,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
         </>}
 
         {mode === 'student' && <section className="student-layout">
-        {activeEmergency && (
+        {activeEmergency ? (
   <div className="card emergency-alert" role="alert">
     <div className="eyebrow">🚨 CAMPUS EMERGENCY ALERT</div>
 
@@ -656,6 +664,14 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
       This is a self-reported safety confirmation, not identity verification.
       Follow official emergency instructions.
     </small>
+  </div>
+) : (
+  <div className="card student-emergency-status" role="status">
+    <span className="emergency-status-icon">✓</span>
+    <div>
+      <strong>No active campus emergency</strong>
+      <p>Emergency alerts will appear here. If security activates one, follow the instructions and confirm your status.</p>
+    </div>
   </div>
 )}
           <div className="card student-card">
@@ -692,12 +708,17 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
           <div className="card security-login-card"><div className="security-lock">◈</div><div className="eyebrow">CAMPUS SECURITY</div><h2>Security sign in</h2><p>Use your assigned guard account to access visitor check-in.</p><form onSubmit={securityLogin}><label htmlFor="security-user">Username</label><input id="security-user" autoComplete="username" value={login.username} onChange={(e) => setLogin({ ...login, username: e.target.value })} required /><label htmlFor="security-password">Password</label><input id="security-password" type="password" autoComplete="current-password" value={login.password} onChange={(e) => setLogin({ ...login, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in securely'}</button></form><div className="privacy-note">Security accounts are set up by the campus administrator.</div></div>
           <aside className="card how-card"><div className="how-icon">⌖</div><div className="eyebrow">GATE DESK</div><h2>One scan for a clear arrival log.</h2><p>Every scan records the guard, the visitor, and the exact check-in or check-out time.</p><div className="privacy-note">QR codes refresh every 30 seconds to reduce replay.</div></aside>
         </section> : <section className="security-dashboard">
-          <div className="security-dashboard-header"><div><div className="eyebrow">LIVE GATE STATUS</div><h2>Welcome, {guardUsername}</h2><p>Visitor access is refreshing automatically.</p></div><div className="security-actions"><button className="secondary-button" onClick={() => loadSecurityDashboard(securityToken)}>Refresh requests</button><button className="secondary-button" onClick={downloadVisitorLog}>⇩ Visitor CSV</button><button className="secondary-button" onClick={downloadAttendanceLog}>⇩ Attendance CSV</button><button className="secondary-button" onClick={() => setShowEmergency((value) => !value)}>Emergency roll call</button><button className="secondary-button" onClick={securityLogout}>Sign out</button></div></div>
+          <div className="security-dashboard-header"><div><div className="eyebrow">LIVE GATE STATUS</div><h2>Welcome, {guardUsername}</h2><p>Visitor access is refreshing automatically.</p></div><div className="security-actions"><button className="secondary-button" onClick={() => loadSecurityDashboard(securityToken)}>Refresh requests</button><button className="secondary-button" onClick={downloadVisitorLog}>⇩ Visitor CSV</button><button className="secondary-button" onClick={downloadAttendanceLog}>⇩ Attendance CSV</button><button className="secondary-button emergency-access-button" onClick={openEmergencyControls}>🚨 Emergency controls</button><button className="secondary-button" onClick={securityLogout}>Sign out</button></div></div>
+          <div className={`security-emergency-status${emergencyRollCall?.active ? ' active' : ''}`} role={emergencyRollCall?.active ? 'alert' : 'status'}>
+            <div><strong>{emergencyRollCall?.active ? `ACTIVE: ${emergencyRollCall.emergency.type.toUpperCase()} EMERGENCY` : 'Emergency response'}</strong><p>{emergencyRollCall?.active ? emergencyRollCall.emergency.message || 'Follow campus emergency procedures and monitor the roll call.' : 'No emergency is active. Use the controls to send an alert to students.'}</p></div>
+            {emergencyRollCall?.active && <span>{emergencyRollCall.confirmedCount} self-reported safe · {emergencyRollCall.unconfirmedCount} not confirmed</span>}
+            <button className="secondary-button emergency-access-button" onClick={openEmergencyControls}>{emergencyRollCall?.active ? 'Open roll call' : 'Open emergency controls'}</button>
+          </div>
           {securityLoadError && <div className="notice error" role="alert"><span>!</span>{securityLoadError}</div>}
           <div className="security-stats"><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{securityData.insideCount}</strong><span>Visitors on campus</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{securityData.attendanceToday || 0}</strong><span>Attendance today</span></div></div><div className="card stat-card"><span className="stat-icon">↗</span><div><strong>{securityData.visitorsToday || 0}</strong><span>Visitor check-ins today</span></div></div><div className="card stat-card"><span className="stat-icon">!</span><div><strong>{securityData.pendingApprovals || 0}</strong><span>Security approvals pending</span></div></div><div className="card scan-launch-card"><div><strong>Gate check-in and exit</strong><span>Scan on arrival; scan again when leaving.</span></div><button className="primary-button" onClick={() => { setIdentityVerified(false); setScanPurpose('visitor'); setScanOn(true) }}>▦ &nbsp; Scan entry or exit</button></div></div>
           {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor’s photo ID for entry</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /><p>Entry: confirm the photo ID before scanning. Exit: scan the visitor’s refreshed QR code again.</p></div>}
           <div className="card security-list-card approval-queue"><div className="roster-heading"><div><div className="eyebrow">VISITOR ACCESS</div><h2>Requests awaiting security approval</h2><p>Review visitor details before activating a pass.</p></div><span className="count-pill">{securityData.approvalQueue?.length || 0} pending</span></div>{securityData.approvalQueue?.length ? <div className="approval-queue-list">{securityData.approvalQueue.map((person) => <article className="approval-request" key={person.passId}><div><strong>{person.fullName}</strong><span>{person.organization} · {person.phone} · {person.email}</span><small>Meeting {person.hostName} · {person.hostDepartment}</small><small>{person.purpose}{person.vehicleNumber ? ` · Vehicle ${person.vehicleNumber}` : ''}</small></div><div className="approval-actions"><button className="primary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'approved')}>Approve</button><button className="secondary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'denied')}>Decline</button></div></article>)}</div> : <div className="roster-empty">No visitor requests are waiting for security approval.</div>}</div>
-          {showEmergency && <section className="card emergency-roll-call">
+          {showEmergency && <section ref={emergencyControlsRef} className="card emergency-roll-call">
           {emergencyRollCall?.active ? (
   <div className="emergency-active-panel">
     <div className="eyebrow">🚨 ACTIVE EMERGENCY</div>
