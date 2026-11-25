@@ -50,7 +50,25 @@ db.exec(`
     scanned_at TEXT NOT NULL, latitude REAL, longitude REAL, qr_slot INTEGER NOT NULL, identity_verified INTEGER NOT NULL DEFAULT 0,
     UNIQUE(pass_id, qr_slot)
   );
-  CREATE INDEX IF NOT EXISTS visitor_events_time_idx ON visitor_events(scanned_at DESC);
+    CREATE INDEX IF NOT EXISTS visitor_events_time_idx ON visitor_events(scanned_at DESC);
+
+  CREATE TABLE IF NOT EXISTS emergencies (
+    id TEXT PRIMARY KEY,
+    emergency_type TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved')),
+    activated_by TEXT NOT NULL,
+    activated_at TEXT NOT NULL,
+    resolved_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS emergency_confirmations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    emergency_id TEXT NOT NULL REFERENCES emergencies(id),
+    student_id TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL,
+    UNIQUE(emergency_id, student_id)
+  );
 `);
 
 const eventColumns = db.prepare("PRAGMA table_info(visitor_events)").all().map((column) => column.name);
@@ -374,6 +392,40 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
   const activeAttendanceSessions = db.prepare("SELECT token, class_name AS className, teacher_name AS teacherName, created_at AS createdAt, expires_at AS expiresAt, (SELECT COUNT(*) FROM attendance_records r WHERE r.session_token = attendance_sessions.token) AS attendanceCount FROM attendance_sessions WHERE expires_at > ? ORDER BY created_at DESC").all(now);
   res.json({ admin: req.admin.username, totalStudents, totalVisitors, studentsCheckedInToday, visitorsInside, campusPresenceRecorded: studentsCheckedInToday + visitorsInside, activeSessions, pendingApprovals, visitorRequestsToday, attendanceToday, visitorEvents, activeAttendanceSessions });
 });
+app.post("/api/admin/assistant", requireAdmin, (req, res) => {
+  const question = cleanText(req.body.question, 240).toLowerCase();
+  if (!question) return jsonError(res, 400, "Enter a question about campus activity.");
+
+  const now = Date.now();
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const todayIso = today.toISOString();
+  const metrics = {
+    studentsCheckedInToday: db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count,
+    visitorsInside: db.prepare("SELECT COUNT(*) AS count FROM visitors WHERE status = 'inside'").get().count,
+    pendingApprovals: db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count,
+    activeSessions: db.prepare("SELECT COUNT(*) AS count FROM attendance_sessions WHERE expires_at > ?").get(now).count,
+  };
+
+  let answer;
+  if (/\b(select|insert|update|delete|drop|alter|pragma|attach|detach|union)\b/.test(question)) {
+    answer = "I can report today's student check-ins, visitors currently inside, pending visitor approvals, active attendance sessions, or today's campus activity summary. This assistant uses predefined reports.";
+  } else if (/\b(summary|overview|activity)\b/.test(question) && !/\bhow many\b/.test(question)) {
+    answer = `Today's campus activity: ${metrics.studentsCheckedInToday} distinct students checked in, ${metrics.visitorsInside} visitors currently inside, ${metrics.pendingApprovals} visitor approvals pending, and ${metrics.activeSessions} attendance sessions active.`;
+  } else if (/\b(approval|approvals|pending|requests)\b/.test(question)) {
+    answer = `${metrics.pendingApprovals} visitor approval${metrics.pendingApprovals === 1 ? " is" : "s are"} pending.`;
+  } else if (/\b(session|sessions|attendance window|active)\b/.test(question)) {
+    answer = `${metrics.activeSessions} attendance session${metrics.activeSessions === 1 ? " is" : "s are"} currently active.`;
+  } else if (/\b(student|students|check.?in|attendance)\b/.test(question)) {
+    answer = `${metrics.studentsCheckedInToday} distinct student${metrics.studentsCheckedInToday === 1 ? " has" : "s have"} checked in today.`;
+  } else if (/\b(visitor|visitors|inside|currently inside)\b/.test(question)) {
+    answer = `${metrics.visitorsInside} visitor${metrics.visitorsInside === 1 ? " is" : "s are"} currently checked in.`;
+  } else {
+    return res.json({ answer: "I can report today's student check-ins, visitors currently inside, pending visitor approvals, active attendance sessions, or today's campus activity summary. This assistant uses predefined reports." });
+  }
+
+  res.json({ answer, metrics, source: "predefined SQLite reports" });
+});
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
   const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
   const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude", "identity_verified"];
@@ -415,11 +467,204 @@ app.post("/api/security/scan", requireGuard, (req, res) => {
 });
 
 const distPath = path.join(projectRoot, "dist");
+
+// ==================== EMERGENCY RESPONSE ====================
+
+// Get the currently active emergency (student-facing)
+app.get("/api/emergency/active", (_req, res) => {
+  const emergency = db.prepare(`
+    SELECT id, emergency_type AS type, message,
+           activated_at AS activatedAt
+    FROM emergencies
+    WHERE status = 'active'
+    ORDER BY activated_at DESC
+    LIMIT 1
+  `).get();
+
+  if (!emergency) return res.json({ active: false });
+
+  res.json({ active: true, emergency });
+});
+
+// Student submits a self-reported safety confirmation
+app.post("/api/emergency/:id/safe", (req, res) => {
+  const studentId = cleanText(req.body.studentId, 80);
+
+  if (!studentId) {
+    return jsonError(res, 400, "Enter your Student ID.");
+  }
+
+  const emergency = db.prepare(
+    "SELECT id FROM emergencies WHERE id = ? AND status = 'active'"
+  ).get(req.params.id);
+
+  if (!emergency) {
+    return jsonError(res, 404, "This emergency is no longer active.");
+  }
+
+  try {
+    db.prepare(`
+      INSERT INTO emergency_confirmations
+      (emergency_id, student_id, confirmed_at)
+      VALUES (?, ?, ?)
+    `).run(req.params.id, studentId, new Date().toISOString());
+
+    res.json({
+      success: true,
+      message: "Your self-reported safety confirmation has been recorded."
+    });
+  } catch (error) {
+    if (String(error.message).includes("UNIQUE constraint failed")) {
+      return jsonError(res, 409, "You have already confirmed that you are safe.");
+    }
+    return jsonError(res, 500, "Could not record your confirmation.");
+  }
+});
+
+// Admin or security activates an emergency
+app.post("/api/emergency/activate", (req, res, next) => {
+  const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const admin = token && adminSessions.get(token);
+  const guard = token && guardSessions.get(token);
+
+  if (admin && admin.expiresAt > Date.now()) {
+    req.emergencyActor = admin.username;
+    return next();
+  }
+
+  if (guard && guard.expiresAt > Date.now()) {
+    req.emergencyActor = guard.username;
+    return next();
+  }
+
+  return jsonError(res, 401, "Admin or security login required.");
+}, (req, res) => {
+  const type = cleanText(req.body.type, 40).toLowerCase();
+  const message = cleanText(req.body.message, 300);
+  const allowedTypes = ["fire", "medical", "earthquake", "other"];
+
+  if (!allowedTypes.includes(type)) {
+    return jsonError(res, 400, "Choose a valid emergency type.");
+  }
+
+  const existing = db.prepare(
+    "SELECT id FROM emergencies WHERE status = 'active' LIMIT 1"
+  ).get();
+
+  if (existing) {
+    return jsonError(res, 409, "An emergency is already active.");
+  }
+
+  const id = randomUUID();
+  const activatedAt = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO emergencies
+    (id, emergency_type, message, status, activated_by, activated_at)
+    VALUES (?, ?, ?, 'active', ?, ?)
+  `).run(id, type, message, req.emergencyActor, activatedAt);
+
+  res.json({
+    success: true,
+    message: "Emergency activated.",
+    emergency: { id, type, message, activatedAt }
+  });
+});
+
+// Admin or security resolves an emergency
+app.post("/api/emergency/:id/resolve", (req, res, next) => {
+  const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const admin = token && adminSessions.get(token);
+  const guard = token && guardSessions.get(token);
+
+  if (admin && admin.expiresAt > Date.now()) {
+    req.emergencyActor = admin.username;
+    return next();
+  }
+
+  if (guard && guard.expiresAt > Date.now()) {
+    req.emergencyActor = guard.username;
+    return next();
+  }
+
+  return jsonError(res, 401, "Admin or security login required.");
+}, (req, res) => {
+  const result = db.prepare(`
+    UPDATE emergencies
+    SET status = 'resolved', resolved_at = ?
+    WHERE id = ? AND status = 'active'
+  `).run(new Date().toISOString(), req.params.id);
+
+  if (!result.changes) {
+    return jsonError(res, 404, "Active emergency not found.");
+  }
+
+  res.json({ success: true, message: "Emergency resolved." });
+});
+
+// Security dashboard: emergency and safety roll call
+app.get("/api/security/emergency", requireGuard, (_req, res) => {
+  const emergency = db.prepare(`
+    SELECT id, emergency_type AS type, message,
+           activated_by AS activatedBy, activated_at AS activatedAt
+    FROM emergencies
+    WHERE status = 'active'
+    ORDER BY activated_at DESC
+    LIMIT 1
+  `).get();
+
+  if (!emergency) {
+    return res.json({ active: false });
+  }
+
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayIso = todayStart.toISOString();
+
+  const roster = db.prepare(`
+    SELECT DISTINCT student_id AS studentId
+    FROM attendance_records
+    WHERE marked_at >= ?
+    ORDER BY student_id
+  `).all(todayIso);
+
+  const confirmations = db.prepare(`
+    SELECT student_id AS studentId, confirmed_at AS confirmedAt
+    FROM emergency_confirmations
+    WHERE emergency_id = ?
+    ORDER BY confirmed_at
+  `).all(emergency.id);
+
+  const confirmedIds = new Set(confirmations.map(item => item.studentId));
+
+  const visitorsInside = db.prepare(`
+    SELECT pass_id AS passId, full_name AS fullName,
+           organization, host_name AS hostName
+    FROM visitors
+    WHERE status = 'inside'
+    ORDER BY full_name
+  `).all();
+
+  res.json({
+    active: true,
+    emergency,
+    confirmed: confirmations,
+    confirmedCount: confirmations.length,
+    unconfirmed: roster.filter(item => !confirmedIds.has(item.studentId)),
+    unconfirmedCount: roster.filter(item => !confirmedIds.has(item.studentId)).length,
+    rosterCount: roster.length,
+    rosterDescription: "Students recorded in attendance today; not a complete campus headcount.",
+    visitorsInside,
+    visitorsInsideCount: visitorsInside.length
+  });
+});
+
 app.use(express.static(distPath));
 app.use((req, res, next) => {
   if (req.method === "GET" && req.accepts("html")) return res.sendFile(path.join(distPath, "index.html"));
   next();
 });
 const port = Number(process.env.PORT || 5000);
-app.listen(port, "0.0.0.0", () => console.log(`CampusPass listening on port ${port}; SQLite database: ${databasePath}`));
-
+const server = app.listen(port, "0.0.0.0", () => console.log(`CampusPass listening on port ${port}; SQLite database: ${databasePath}`));
+server.on("close", () => console.log("server close event fired"));
+server.on("error", (err) => console.log("server error event fired:", err));

@@ -17,4 +17,7 @@ services:
         value: campus-admin
       - key: ADMIN_PASSWORD
         generateValue: true
-
+      - key: TEACHER_USERNAME
+        value: campus-teacher
+      - key: TEACHER_PASSWORD
+        generateValue: true
