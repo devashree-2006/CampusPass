@@ -58,11 +58,17 @@ function App() {
   const [adminUsername, setAdminUsername] = useState(() => sessionStorage.getItem('campuspass.adminName') || '')
   const [adminLoginForm, setAdminLoginForm] = useState({ username: '', password: '' })
   const [adminData, setAdminData] = useState(null)
+  const [assistantQuestion, setAssistantQuestion] = useState('')
+  const [assistantAnswer, setAssistantAnswer] = useState('')
+  const [assistantBusy, setAssistantBusy] = useState(false)
   const [session, setSession] = useState(null)
   const [attendees, setAttendees] = useState([])
   const [attendanceQr, setAttendanceQr] = useState(null)
   const [attendanceQrSeconds, setAttendanceQrSeconds] = useState(0)
   const [studentId, setStudentId] = useState('')
+  const [activeEmergency, setActiveEmergency] = useState(null)
+  const [safetySubmitting, setSafetySubmitting] = useState(false)
+  const [safetyMessage, setSafetyMessage] = useState('')
   const [qrInput, setQrInput] = useState('')
   const [scanOn, setScanOn] = useState(false)
   const [scanPurpose, setScanPurpose] = useState('attendance')
@@ -78,6 +84,11 @@ function App() {
   const [identityVerified, setIdentityVerified] = useState(false)
   const [showEmergency, setShowEmergency] = useState(false)
   const [emergencySearch, setEmergencySearch] = useState('')
+  const [emergencyType, setEmergencyType] = useState('fire')
+const [emergencyMessage, setEmergencyMessage] = useState('')
+const [emergencyActionBusy, setEmergencyActionBusy] = useState(false)
+const [emergencyActionMessage, setEmergencyActionMessage] = useState('')
+const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   const [visitorPass, setVisitorPass] = useState(null)
   const [visitorQr, setVisitorQr] = useState(null)
   const [visitorQrSeconds, setVisitorQrSeconds] = useState(0)
@@ -86,7 +97,14 @@ function App() {
   const [securityLoadError, setSecurityLoadError] = useState('')
   const [login, setLogin] = useState({ username: '', password: '' })
   const [securityData, setSecurityData] = useState({ inside: [], insideCount: 0, recentEvents: [], approvalQueue: [] })
-
+  const loadActiveEmergency = useCallback(async () => {
+  try {
+    const data = await request('/api/emergency/active')
+    setActiveEmergency(data.active ? data.emergency : null)
+  } catch {
+    // Keep the existing screen usable if the request temporarily fails.
+  }
+}, [])
   const loadAttendees = useCallback(async (token) => {
     try {
       const data = await request(`/api/attendance/${encodeURIComponent(token)}/records`, {}, teacherToken)
@@ -108,6 +126,63 @@ function App() {
       }
     }
   }, [])
+
+    const loadEmergencyRollCall = useCallback(async (token) => {
+    try {
+      const data = await request('/api/security/emergency', {}, token)
+      setEmergencyRollCall(data.active ? data : null)
+    } catch (error) {
+      setEmergencyActionMessage(error.message)
+    }
+  }, [])
+
+  const activateEmergency = async () => {
+    setEmergencyActionBusy(true)
+    setEmergencyActionMessage('')
+
+    try {
+      const data = await request('/api/emergency/activate', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: emergencyType,
+          message: emergencyMessage.trim(),
+        }),
+      }, securityToken)
+
+      setEmergencyActionMessage(data.message)
+      await loadEmergencyRollCall(securityToken)
+      await loadActiveEmergency()
+    } catch (error) {
+      setEmergencyActionMessage(error.message)
+    } finally {
+      setEmergencyActionBusy(false)
+    }
+  }
+
+  const resolveEmergency = async () => {
+    if (!emergencyRollCall?.emergency?.id) return
+
+    if (!window.confirm('Are you sure you want to resolve this emergency?')) return
+
+    setEmergencyActionBusy(true)
+    setEmergencyActionMessage('')
+
+    try {
+      const data = await request(
+        `/api/emergency/${encodeURIComponent(emergencyRollCall.emergency.id)}/resolve`,
+        { method: 'POST' },
+        securityToken
+      )
+
+      setEmergencyActionMessage(data.message)
+      setEmergencyRollCall(null)
+      await loadActiveEmergency()
+    } catch (error) {
+      setEmergencyActionMessage(error.message)
+    } finally {
+      setEmergencyActionBusy(false)
+    }
+  }
 
   const loadAdminDashboard = useCallback(async (token) => {
     try { setAdminData(await request('/api/admin/dashboard', {}, token)) }
@@ -151,11 +226,55 @@ function App() {
   }, [attendanceQr])
 
   useEffect(() => {
-    if (!securityToken) return undefined
-    const initial = window.setTimeout(() => loadSecurityDashboard(securityToken), 0)
-    const timer = window.setInterval(() => loadSecurityDashboard(securityToken), 5000)
+  if (!securityToken) return undefined
+
+  const refresh = () => {
+    loadSecurityDashboard(securityToken)
+    loadEmergencyRollCall(securityToken)
+  }
+
+  const initial = window.setTimeout(refresh, 0)
+  const timer = window.setInterval(refresh, 5000)
+
+  return () => {
+    window.clearTimeout(initial)
+    window.clearInterval(timer)
+  }
+}, [securityToken, loadSecurityDashboard, loadEmergencyRollCall])
+
+  const confirmSafety = async () => {
+  if (!studentId.trim()) {
+    setSafetyMessage('Please enter your Student ID in the attendance form below.')
+    return
+  }
+
+  if (!activeEmergency) return
+
+  setSafetySubmitting(true)
+  setSafetyMessage('')
+
+  try {
+    const data = await request(
+      `/api/emergency/${encodeURIComponent(activeEmergency.id)}/safe`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ studentId: studentId.trim() }),
+      }
+    )
+
+    setSafetyMessage(data.message)
+  } catch (error) {
+    setSafetyMessage(error.message)
+  } finally {
+    setSafetySubmitting(false)
+  }
+}
+
+  useEffect(() => {
+    const initial = window.setTimeout(loadActiveEmergency, 0)
+    const timer = window.setInterval(loadActiveEmergency, 5000)
     return () => { window.clearTimeout(initial); window.clearInterval(timer) }
-  }, [securityToken, loadSecurityDashboard])
+  }, [loadActiveEmergency])
 
   useEffect(() => {
     if (!adminToken) return undefined
@@ -297,6 +416,23 @@ function App() {
       setMessage({ type: 'success', text: `Signed in as ${data.username}.` })
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
+  }
+
+  async function askCampusAssistant(event) {
+    event.preventDefault()
+    setAssistantBusy(true)
+    setAssistantAnswer('')
+    try {
+      const data = await request('/api/admin/assistant', {
+        method: 'POST',
+        body: JSON.stringify({ question: assistantQuestion }),
+      }, adminToken)
+      setAssistantAnswer(data.answer)
+    } catch (error) {
+      setAssistantAnswer(error.message)
+    } finally {
+      setAssistantBusy(false)
+    }
   }
 
   async function adminLogout() {
@@ -486,6 +622,42 @@ function App() {
         </>}
 
         {mode === 'student' && <section className="student-layout">
+        {activeEmergency && (
+  <div className="card emergency-alert" role="alert">
+    <div className="eyebrow">🚨 CAMPUS EMERGENCY ALERT</div>
+
+    <h2>{activeEmergency.type.toUpperCase()} EMERGENCY</h2>
+
+    <p>
+      {activeEmergency.message ||
+        'An emergency has been reported on campus. Follow instructions from campus authorities.'}
+    </p>
+
+    <p>
+      Enter your Student ID in the attendance form below, then confirm your status.
+    </p>
+
+    <button
+      className="primary-button"
+      type="button"
+      onClick={confirmSafety}
+      disabled={safetySubmitting}
+    >
+      {safetySubmitting ? 'Submitting…' : '✓ I AM SAFE'}
+    </button>
+
+    {safetyMessage && (
+      <p className="safety-message" role="status">
+        {safetyMessage}
+      </p>
+    )}
+
+    <small>
+      This is a self-reported safety confirmation, not identity verification.
+      Follow official emergency instructions.
+    </small>
+  </div>
+)}
           <div className="card student-card">
             <div className="card-heading"><span className="step-number">01</span><div><h2>Scan your class QR</h2><p>Point your camera at the code shown by your teacher.</p></div></div>
             {scanOn && scanPurpose === 'attendance' ? <><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close camera</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /></> : <button type="button" className="scan-button" onClick={() => { setMessage(null); setScanPurpose('attendance'); setScanOn(true) }}><span className="scan-symbol">▦</span><span><strong>Open camera to scan</strong><small>Fast QR scanning · back camera preferred</small></span><b>→</b></button>}
@@ -526,6 +698,92 @@ function App() {
           {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor’s photo ID for entry</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /><p>Entry: confirm the photo ID before scanning. Exit: scan the visitor’s refreshed QR code again.</p></div>}
           <div className="card security-list-card approval-queue"><div className="roster-heading"><div><div className="eyebrow">VISITOR ACCESS</div><h2>Requests awaiting security approval</h2><p>Review visitor details before activating a pass.</p></div><span className="count-pill">{securityData.approvalQueue?.length || 0} pending</span></div>{securityData.approvalQueue?.length ? <div className="approval-queue-list">{securityData.approvalQueue.map((person) => <article className="approval-request" key={person.passId}><div><strong>{person.fullName}</strong><span>{person.organization} · {person.phone} · {person.email}</span><small>Meeting {person.hostName} · {person.hostDepartment}</small><small>{person.purpose}{person.vehicleNumber ? ` · Vehicle ${person.vehicleNumber}` : ''}</small></div><div className="approval-actions"><button className="primary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'approved')}>Approve</button><button className="secondary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'denied')}>Decline</button></div></article>)}</div> : <div className="roster-empty">No visitor requests are waiting for security approval.</div>}</div>
           {showEmergency && <section className="card emergency-roll-call">
+          {emergencyRollCall?.active ? (
+  <div className="emergency-active-panel">
+    <div className="eyebrow">🚨 ACTIVE EMERGENCY</div>
+    <h2>{emergencyRollCall.emergency.type.toUpperCase()} EMERGENCY</h2>
+    <p>{emergencyRollCall.emergency.message || 'No additional instructions provided.'}</p>
+
+    <div className="emergency-counts">
+      <div>
+        <strong>{emergencyRollCall.confirmedCount}</strong>
+        <span>Self-reported safe</span>
+      </div>
+      <div>
+        <strong>{emergencyRollCall.unconfirmedCount}</strong>
+        <span>Not yet confirmed</span>
+      </div>
+      <div>
+        <strong>{emergencyRollCall.visitorsInsideCount}</strong>
+        <span>Visitors inside</span>
+      </div>
+    </div>
+
+    <div className="emergency-confirmed-list">
+      <h3>Student confirmations</h3>
+      {emergencyRollCall.confirmed?.length ? emergencyRollCall.confirmed.map((item) => (
+        <div className="event-row" key={item.studentId}>
+          <span className="event-mark">✓</span>
+          <div><strong>{item.studentId}</strong><span>Self-reported safe · Identity not verified</span></div>
+          <time>{new Date(item.confirmedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
+        </div>
+      )) : <div className="roster-empty">No student confirmations yet.</div>}
+      {emergencyRollCall.unconfirmed?.length > 0 && <>
+        <h3>Not yet confirmed ({emergencyRollCall.unconfirmed.length})</h3>
+        {emergencyRollCall.unconfirmed.map((item) => <div className="event-row" key={item.studentId}>
+          <span className="event-mark out">!</span>
+          <div><strong>{item.studentId}</strong><span>Checked in today · No safety confirmation recorded</span></div>
+        </div>)}
+      </>}
+      <small>{emergencyRollCall.rosterDescription} Student confirmations are self-reported and do not verify identity.</small>
+    </div>
+
+    <button
+      className="primary-button"
+      onClick={resolveEmergency}
+      disabled={emergencyActionBusy}
+    >
+      {emergencyActionBusy ? 'Please wait…' : 'Resolve Emergency'}
+    </button>
+  </div>
+) : (
+  <div className="emergency-active-panel">
+    <div className="eyebrow">EMERGENCY CONTROL</div>
+    <h2>Activate Campus Emergency</h2>
+
+    <label htmlFor="emergency-type">Emergency type</label>
+    <select
+      id="emergency-type"
+      value={emergencyType}
+      onChange={(event) => setEmergencyType(event.target.value)}
+    >
+      <option value="fire">Fire</option>
+      <option value="medical">Medical</option>
+      <option value="earthquake">Earthquake</option>
+      <option value="other">Other</option>
+    </select>
+
+    <label htmlFor="emergency-message">Instructions (optional)</label>
+    <textarea
+      id="emergency-message"
+      value={emergencyMessage}
+      onChange={(event) => setEmergencyMessage(event.target.value)}
+      placeholder="Enter emergency instructions for students..."
+    />
+
+    <button
+      className="primary-button"
+      onClick={activateEmergency}
+      disabled={emergencyActionBusy}
+    >
+      {emergencyActionBusy ? 'Activating…' : '🚨 Activate Emergency'}
+    </button>
+  </div>
+)}
+
+{emergencyActionMessage && (
+  <p role="status">{emergencyActionMessage}</p>
+)}
             <div className="roster-heading"><div><div className="eyebrow">EMERGENCY VIEW</div><h2>Campus roll call</h2><p>Recorded check-ins for today and visitors currently inside.</p></div><button className="secondary-button" onClick={() => window.print()}>Print roll call</button></div>
             <div className="location-note"><span>!</span><div><strong>{filteredStudents.length} student check-ins · {filteredInside.length} visitors inside</strong><small>Use this as a live record of app check-ins; it does not detect people who have not checked in.</small></div></div>
             <label className="emergency-search-label" htmlFor="emergency-search">Search roll call</label><input id="emergency-search" value={emergencySearch} onChange={(event) => setEmergencySearch(event.target.value)} placeholder="Student, class, visitor or organization" />
@@ -540,6 +798,20 @@ function App() {
           <div className="security-dashboard-header"><div><div className="eyebrow">CAMPUS OVERVIEW</div><h2>Welcome, {adminUsername}</h2><p>Live campus activity refreshes every 10 seconds.</p></div><div className="security-actions"><button className="secondary-button" onClick={() => loadAdminDashboard(adminToken)}>Refresh now</button><button className="secondary-button" onClick={adminLogout}>Sign out</button></div></div>
           <div className="admin-stats"><div className="card stat-card"><span className="stat-icon">♙</span><div><strong>{adminData?.totalStudents || 0}</strong><span>Student IDs recorded</span></div></div><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{adminData?.totalVisitors || 0}</strong><span>Visitor passes issued</span></div></div><div className="card stat-card"><span className="stat-icon">◎</span><div><strong>{adminData?.campusPresenceRecorded || 0}</strong><span>Recorded campus presence*</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{adminData?.visitorsInside || 0}</strong><span>Visitors currently checked in</span></div></div><div className="card stat-card"><span className="stat-icon">✓</span><div><strong>{adminData?.studentsCheckedInToday || 0}</strong><span>Distinct students checked in today</span></div></div><div className="card stat-card"><span className="stat-icon">▦</span><div><strong>{adminData?.activeSessions || 0}</strong><span>Attendance sessions open</span></div></div></div>
           <div className="admin-presence-note">*Recorded campus presence adds today’s distinct student check-ins to visitors whose entry is still open. Student attendance has no checkout scan, so this is an operational estimate, not a physical headcount.</div>
+          <section className="card campus-assistant">
+            <div className="eyebrow">CAMPUS ASSISTANT</div>
+            <h2>Ask about campus activity</h2>
+            <p>Get a quick answer from predefined reports. Example: “How many visitors are inside?”</p>
+            <form onSubmit={askCampusAssistant}>
+              <label htmlFor="campus-assistant-question">Your question</label>
+              <div className="assistant-input-row">
+                <input id="campus-assistant-question" value={assistantQuestion} onChange={(event) => setAssistantQuestion(event.target.value)} placeholder="How many visitor approvals are pending?" required />
+                <button className="primary-button" type="submit" disabled={assistantBusy}>{assistantBusy ? 'Checking…' : 'Ask'}</button>
+              </div>
+            </form>
+            {assistantAnswer && <p className="assistant-answer" role="status">{assistantAnswer}</p>}
+            <small>This assistant answers from fixed SQLite reports. It does not generate SQL or use an AI model.</small>
+          </section>
           <div className="security-panels admin-panels"><div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">OPEN CLASS SESSIONS</div><h2>Live attendance windows</h2></div><span className="count-pill">{adminData?.activeAttendanceSessions?.length || 0} live</span></div>{adminData?.activeAttendanceSessions?.length ? <div className="event-list">{adminData.activeAttendanceSessions.map((item) => <div className="event-row" key={item.token}><span className="event-mark">◷</span><div><strong>{item.className}</strong><span>{item.teacherName} · {item.attendanceCount} check-ins</span></div><time>Ends {new Date(item.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No attendance sessions are open right now.</div>}</div>
             <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">TODAY’S STUDENT CHECK-INS</div><h2>Attendance activity</h2></div><span className="count-pill">{adminData?.attendanceToday?.length || 0} recent</span></div>{adminData?.attendanceToday?.length ? <div className="event-list">{adminData.attendanceToday.map((row, index) => <div className="event-row" key={`${row.className}-${row.studentId}-${row.markedAt}-${index}`}><span className="event-mark">✓</span><div><strong>{row.studentId}</strong><span>{row.className} · {row.teacherName}</span></div><time>{new Date(row.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No student check-ins recorded today.</div>}</div>
             <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">VISITOR GATE ACTIVITY</div><h2>Recent visitor movements</h2></div><span className="count-pill">{adminData?.pendingApprovals || 0} approvals pending</span></div>{adminData?.visitorEvents?.length ? <div className="event-list">{adminData.visitorEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername} · Host {event.hostName}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">No visitor scans have been recorded.</div>}</div>
@@ -552,5 +824,4 @@ function App() {
 }
 
 export default App
-
 

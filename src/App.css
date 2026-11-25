@@ -194,6 +194,16 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .admin-dashboard { display: grid; gap: 16px; }
 .admin-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
 .admin-presence-note { padding: 11px 14px; border: 1px solid #e7eee8; border-radius: 9px; background: #fbfdfb; color: #819087; font-size: 10px; line-height: 1.6; }
+.campus-assistant { padding: 20px; }
+.campus-assistant h2 { margin: 7px 0; color: #315140; font-size: 18px; }
+.campus-assistant > p { margin: 0 0 14px; color: #819087; font-size: 11px; }
+.campus-assistant label { display: block; margin-bottom: 6px; color: #52675a; font-size: 11px; font-weight: 700; }
+.assistant-input-row { display: flex; gap: 10px; }
+.assistant-input-row input { min-width: 0; flex: 1; }
+.campus-assistant .assistant-answer { margin: 14px 0 8px; padding: 12px; border-radius: 9px; background: #f1f7f2; color: #315140; line-height: 1.5; }
+.campus-assistant > small, .emergency-confirmed-list > small { display: block; margin-top: 10px; color: #819087; font-size: 10px; line-height: 1.5; }
+.emergency-confirmed-list { padding: 12px; border: 1px solid #f2dada; border-radius: 10px; background: #fff; color: #59655d; }
+.emergency-confirmed-list h3 { margin: 12px 0 0; color: #694646; font-size: 12px; }
 .admin-panels { align-items: start; }
 .admin-panels .security-list-card { min-height: 235px; }
 .session-export-button { display: block; width: 100%; margin-top: 16px; }
@@ -294,4 +304,104 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 
 .security-actions { flex-wrap: wrap; }
 .security-actions button { min-width: 112px; }
+/* Emergency response alert */
+.emergency-alert {
+  grid-column: 1 / -1;
+  border: 2px solid #dc2626;
+  background: #fff1f2;
+  color: #7f1d1d;
+  padding: 24px;
+  margin-bottom: 20px;
+}
 
+.emergency-alert h2 {
+  color: #b91c1c;
+  margin: 10px 0;
+}
+
+.emergency-alert p {
+  margin-bottom: 16px;
+}
+
+.emergency-alert form {
+  display: grid;
+  gap: 12px;
+  max-width: 440px;
+}
+
+.emergency-alert input {
+  width: 100%;
+}
+
+.emergency-alert .primary-button {
+  background: #dc2626;
+  color: white;
+}
+
+.emergency-alert small {
+  display: block;
+  margin-top: 14px;
+  line-height: 1.5;
+}
+
+.safety-message {
+  font-weight: 600;
+  margin-top: 12px;
+}
+
+.emergency-active-panel {
+  border: 1px solid #fecaca;
+  background: #fff7f7;
+  color: #7f1d1d;
+  border-radius: 14px;
+  padding: 22px;
+  margin-bottom: 20px;
+}
+
+.emergency-active-panel h2 {
+  color: #b91c1c;
+  margin: 8px 0 12px;
+}
+
+.emergency-active-panel label {
+  display: block;
+  font-weight: 600;
+  margin: 12px 0 6px;
+}
+
+.emergency-active-panel select,
+.emergency-active-panel textarea {
+  display: block;
+  width: 100%;
+  max-width: 500px;
+  padding: 11px;
+  border: 1px solid #e5bcbc;
+  border-radius: 8px;
+  font: inherit;
+  margin-bottom: 10px;
+}
+
+.emergency-active-panel textarea {
+  min-height: 85px;
+  resize: vertical;
+}
+
+.emergency-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin: 20px 0;
+}
+
+.emergency-counts div {
+  display: grid;
+  gap: 4px;
+}
+
+.emergency-counts strong {
+  font-size: 1.7rem;
+}
+
+.emergency-counts span {
+  font-size: 0.85rem;
+}
