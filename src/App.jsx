@@ -51,8 +51,15 @@ function getLocation() {
     if (!navigator.geolocation) return reject(new Error('Location is not available in this browser.'))
     navigator.geolocation.getCurrentPosition(
       ({ coords }) => resolve({ lat: coords.latitude, lon: coords.longitude, accuracy: coords.accuracy }),
-      (error) => reject(new Error(error.code === 1 ? 'Allow location access to continue.' : 'Location is unavailable. On a phone, open the app over HTTPS and allow location access.')),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
+      (error) => {
+        if (error.code === 1) return reject(new Error('Allow location access to continue.'))
+        navigator.geolocation.getCurrentPosition(
+          ({ coords }) => resolve({ lat: coords.latitude, lon: coords.longitude, accuracy: coords.accuracy }),
+          () => reject(new Error('Location is unavailable. On a phone, open the app over HTTPS and allow location access.')),
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 },
+        )
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 15000 },
     )
   })
 }
@@ -92,6 +99,9 @@ function App() {
   const [attendees, setAttendees] = useState([])
   const [absentees, setAbsentees] = useState([])
   const [registeredCount, setRegisteredCount] = useState(0)
+  const [manualStudentId, setManualStudentId] = useState('')
+  const [rosterSearch, setRosterSearch] = useState('')
+  const [manualMarkBusy, setManualMarkBusy] = useState(false)
   const [attendanceQr, setAttendanceQr] = useState(null)
   const [attendanceQrSeconds, setAttendanceQrSeconds] = useState(0)
   const [studentId, setStudentId] = useState('')
@@ -147,6 +157,56 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
       setRegisteredCount(data.registeredCount || 0)
     } catch { /* the session can expire while this screen remains open */ }
   }, [teacherToken])
+
+  async function markStudentByTeacher(targetId) {
+    if (!session?.token) return
+    const idToMark = (targetId || manualStudentId).trim()
+    if (!idToMark) return
+    setManualMarkBusy(true); setMessage(null)
+    try {
+      const data = await request(`/api/teacher/attendance/${encodeURIComponent(session.token)}/mark`, {
+        method: 'POST',
+        body: JSON.stringify({ studentId: idToMark }),
+      }, teacherToken)
+      if (!targetId) setManualStudentId('')
+      setMessage({ type: 'success', text: data.message })
+      await loadAttendees(session.token)
+      if (historyReport) void loadAttendanceHistory()
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setManualMarkBusy(false)
+    }
+  }
+
+  async function unmarkStudentByTeacher(targetId) {
+    if (!session?.token || !targetId) return
+    setManualMarkBusy(true); setMessage(null)
+    try {
+      const data = await request(`/api/teacher/attendance/${encodeURIComponent(session.token)}/mark/${encodeURIComponent(targetId)}`, {
+        method: 'DELETE',
+      }, teacherToken)
+      setMessage({ type: 'success', text: data.message })
+      await loadAttendees(session.token)
+      if (historyReport) void loadAttendanceHistory()
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setManualMarkBusy(false)
+    }
+  }
+
+  async function openHistorySession(item) {
+    setSession({
+      token: item.token,
+      className: item.className,
+      teacherName: item.teacherName,
+      expiresAt: 0,
+    })
+    setAttendanceQr(null)
+    await loadAttendees(item.token)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 
   const loadSecurityDashboard = useCallback(async (token) => {
     try {
@@ -619,7 +679,11 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   }
 
   function shareOnGmail(subject, text) {
-    window.open(`https://mail.google.com/mail/?view=cm&fs=1&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer')
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&fs=1&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`
+    const win = window.open(gmailUrl, '_blank', 'noopener,noreferrer')
+    if (!win) {
+      window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`
+    }
   }
 
   async function downloadAttendanceHistory(share = false) {
@@ -837,7 +901,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
                     </button>
                   ))}
                 </div>
-                <div className="location-note"><span>◎</span><div><strong>Your location anchors this session</strong><small>GPS accuracy is included in the 50 metre check.</small></div></div>
+                <div className="location-note"><span>◎</span><div><strong>Your location anchors this session</strong><small>GPS accuracy is included in the 200 metre check.</small></div></div>
                 <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Getting your location…' : '↗  Start attendance'}</button>
               </form>
             </div>
@@ -846,17 +910,71 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
                 <div className="card-heading"><span className={`live-indicator ${expired ? 'ended' : ''}`} /><div><h2>{expired ? 'Session ended' : 'Session is live'}</h2><p>{session.className || className || 'Class attendance'}</p></div><span className="timer">{expired ? '00:00' : `${String(Math.floor(remaining / 60)).padStart(2, '0')}:${String(remaining % 60).padStart(2, '0')}`}</span></div>
                 {session.teacherName && <div className="session-teacher">Hosted by {session.teacherName}</div>}
                 <div className="qr-wrap">{!expired && (attendanceQr?.qrCode ? <img src={attendanceQr.qrCode} alt="Rotating attendance QR code" /> : <div className="qr-placeholder">▦</div>)}<div className="qr-caption">{expired ? 'Start a new session to generate another code.' : `Code refreshes in ${attendanceQrSeconds}s`}</div>{!expired && attendanceQr?.payload && <button className="same-device-button" onClick={() => { setQrInput(attendanceQr.payload); setMode('student'); setMessage({ type: 'success', text: 'Current session code is ready. Enter your student ID to check in on this device.' }) }}>Check in on this device</button>}</div>
-                <div className="session-meta"><span>⌖  50 m radius + GPS accuracy</span><span>◷  5 minute session</span></div>
+                <div className="session-meta"><span>⌖  200 m radius + GPS accuracy</span><span>◷  5 minute session</span></div>
                 <button className="secondary-button session-export-button" onClick={downloadSessionAttendance}>⇩ Download this session’s student attendance CSV</button>
-              </> : <div className="empty-session"><div className="qr-placeholder">▦</div><h2>Your QR code appears here</h2><p>Start an attendance session to create a secure, time-limited check-in code.</p><div className="session-meta"><span>⌖  50 m location check</span><span>◷  5 minute session</span></div></div>}
+              </> : <div className="empty-session"><div className="qr-placeholder">▦</div><h2>Your QR code appears here</h2><p>Start an attendance session to create a secure, time-limited check-in code.</p><div className="session-meta"><span>⌖  200 m location check</span><span>◷  5 minute session</span></div></div>}
             </div>
             <div className="card roster-card">
               <div className="roster-heading"><div><div className="eyebrow">LIVE ROSTER</div><h2>Class check-ins</h2></div><span className="count-pill">{attendees.length} present{registeredCount ? ` · ${absentees.length} absent` : ''}</span></div>
-              {attendees.length ? <div className="roster-list">{attendees.map((person) => <div className="roster-person" key={person.studentId}><span className="avatar">{person.studentId.slice(0, 1).toUpperCase()}</span><strong>{person.studentId}</strong><span>{new Date(person.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span><b>✓</b></div>)}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in…' : 'Your student check-ins will appear here.'}</div>}
+              {session && (
+                <form className="manual-mark-row" onSubmit={(event) => { event.preventDefault(); void markStudentByTeacher() }}>
+                  <input
+                    value={manualStudentId}
+                    onChange={(event) => setManualStudentId(event.target.value)}
+                    placeholder="Mark student manually (e.g. 4CB24CS042)"
+                    aria-label="Student ID to mark present"
+                  />
+                  <button className="secondary-button" type="submit" disabled={manualMarkBusy || !manualStudentId.trim()}>
+                    {manualMarkBusy ? 'Saving…' : '+ Mark present'}
+                  </button>
+                </form>
+              )}
+              {attendees.length ? <div className="roster-list">{attendees.map((person) => (
+                <div className="roster-person" key={person.studentId}>
+                  <span className="avatar">{person.studentId.slice(0, 1).toUpperCase()}</span>
+                  <strong>{person.studentId}{person.markedBy === 'teacher' && <em className="teacher-marked-tag">Marked by teacher</em>}</strong>
+                  <span>{new Date(person.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  <b>✓</b>
+                  {session && (
+                    <button
+                      type="button"
+                      className="roster-remove-btn"
+                      title={`Remove ${person.studentId}`}
+                      disabled={manualMarkBusy}
+                      onClick={() => void unmarkStudentByTeacher(person.studentId)}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in, or mark students manually above…' : 'Start a session (or open one from history below) to view and mark students.'}</div>}
               {session && registeredCount > 0 && absentees.length > 0 && (
                 <div className="live-absentees-box">
-                  <strong>Absentees / not yet checked in ({absentees.length})</strong>
-                  <div className="absentee-chips">{absentees.map((usn) => <span key={usn}>{usn}</span>)}</div>
+                  <div className="absentees-header">
+                    <strong>Absentees / not yet checked in ({absentees.length}) — tap a student to mark present</strong>
+                    <input
+                      className="absentee-search-input"
+                      value={rosterSearch}
+                      onChange={(event) => setRosterSearch(event.target.value)}
+                      placeholder="Filter USN…"
+                      aria-label="Filter absent students"
+                    />
+                  </div>
+                  <div className="absentee-chips">
+                    {absentees
+                      .filter((usn) => usn.toLowerCase().includes(rosterSearch.trim().toLowerCase()))
+                      .map((usn) => (
+                        <button
+                          type="button"
+                          key={usn}
+                          className="absentee-mark-btn"
+                          disabled={manualMarkBusy}
+                          onClick={() => void markStudentByTeacher(usn)}
+                        >
+                          {usn} <span>+ Mark</span>
+                        </button>
+                      ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -897,7 +1015,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
                 </div>
               )}
               {filteredHistoryStudents.length ? <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Absent</th><th>Attendance</th><th>Notify parent</th></tr></thead><tbody>{filteredHistoryStudents.map((student) => <tr key={student.studentId}><td>{student.studentId}</td><td>{student.attendedSessions} / {student.totalSessions}</td><td>{student.absentSessions}</td><td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td><td className="parent-share-cell"><button type="button" className="mini-share-btn whatsapp" onClick={() => shareOnWhatsApp(buildStudentParentMessage(historyReport, student))}>WhatsApp</button><button type="button" className="mini-share-btn gmail" onClick={() => shareOnGmail(`${student.studentId} · ${historyReport.className} Attendance`, buildStudentParentMessage(historyReport, student))}>Gmail</button></td></tr>)}</tbody></table></div> : <div className="roster-empty">No matching students for this class and period.</div>}
-              <div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.length ? historyReport.sessions.map((item, index) => <span key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins</span>) : <span>No sessions held in this date range yet. Registered students are shown at 0%.</span>}</div>
+              <div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.length ? historyReport.sessions.map((item, index) => <span className="history-session-row" key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins <button type="button" className="mini-share-btn" onClick={() => void openHistorySession(item)}>Manage / mark students</button></span>) : <span>No sessions held in this date range yet. Registered students are shown at 0%.</span>}</div>
               <div className="history-share-note">Use Share on WhatsApp or Share on Gmail for the whole class summary, or notify an individual student’s parent directly from any row.</div>
             </> : <div className="roster-empty">Select a class above (e.g. CSE 3A, CSE 3B, or CSE 3C) and load attendance for 15 days, 30 days, or a custom date range.</div>}
           </section>
@@ -1024,8 +1142,10 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
               let proximityBadge
               if (hasVisitorLoc && guardLocation) {
                 const rawDistance = Math.round(distanceMetresClient(person.visitorLat, person.visitorLon, guardLocation.lat, guardLocation.lon))
-                const allowance = Math.min(100, Math.round((person.visitorAccuracy || 0) + (guardLocation.accuracy || 0)))
-                const samePlace = Math.max(0, rawDistance - allowance) <= 50
+                const acc1 = Number.isFinite(person.visitorAccuracy) ? Math.max(0, Math.min(5000, person.visitorAccuracy)) : 0
+                const acc2 = Number.isFinite(guardLocation.accuracy) ? Math.max(0, Math.min(5000, guardLocation.accuracy)) : 0
+                const allowance = Math.min(5000, Math.round(acc1 + acc2))
+                const samePlace = Math.max(0, rawDistance - allowance) <= 200
                 proximityBadge = (
                   <small className={`gps-match-badge ${samePlace ? 'match' : 'mismatch'}`}>
                     {samePlace ? `✓ Same place (~${rawDistance} m apart)` : `! Different location (~${rawDistance} m apart)`}

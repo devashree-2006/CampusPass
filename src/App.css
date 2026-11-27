@@ -467,3 +467,16 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 @media (max-width: 760px) {
   .visitor-gps-box { flex-direction: column; align-items: stretch; }
 }
+.manual-mark-row { display: flex; gap: 8px; margin-top: 14px; }
+.manual-mark-row input { flex: 1; }
+.manual-mark-row .secondary-button { flex-shrink: 0; }
+.teacher-marked-tag { margin-left: 8px; padding: 2px 6px; border-radius: 5px; background: #edf6f0; color: #1f744c; font-style: normal; font-size: 9px; font-weight: 700; }
+.roster-remove-btn { border: 1px solid #e7ece7; border-radius: 6px; width: 24px; height: 24px; background: #fff; color: #8c5338; font-weight: 700; line-height: 1; }
+.roster-remove-btn:hover:not(:disabled) { background: #fff3ee; border-color: #ebc9b8; }
+.absentees-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.absentees-header strong { margin-bottom: 0; }
+.absentee-search-input { width: 190px; padding: 7px 10px; font-size: 11px; }
+.absentee-mark-btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 6px; background: #fff5ee; border: 1px solid #f2ddd0; color: #94573a; font-size: 10px; font-weight: 700; }
+.absentee-mark-btn span { color: #126346; }
+.absentee-mark-btn:hover:not(:disabled) { background: #edf6f0; border-color: #b7dec7; color: #19251f; }
+.history-session-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }

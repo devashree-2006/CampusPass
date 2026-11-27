@@ -100,6 +100,8 @@ ensureColumn("visitor_approvals", "distance_metres", "REAL");
 ensureColumn("visitor_approvals", "estimated_distance", "REAL");
 ensureColumn("visitor_approvals", "location_verified", "INTEGER NOT NULL DEFAULT 0");
 
+ensureColumn("attendance_records", "marked_by", "TEXT NOT NULL DEFAULT 'student'");
+
 ensureColumn("visitor_events", "identity_verified", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("visitor_events", "guard_accuracy", "REAL");
 ensureColumn("visitor_events", "visitor_lat", "REAL");
@@ -133,7 +135,8 @@ function seedDefaultStudents() {
 
 seedDefaultStudents();
 
-const RADIUS_METRES = 50;
+const RADIUS_METRES = 200;
+const MAX_ACCURACY_ALLOWANCE = 5000;
 const ATTENDANCE_QR_VALIDITY = 5 * 60 * 1000;
 const VISITOR_QR_SLOT_MS = 30 * 1000;
 const VISITOR_QR_SKEW_SLOTS = 1;
@@ -165,19 +168,28 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "32kb" }));
 function jsonError(res, status, message) { return res.status(status).json({ message }); }
 function cleanText(value, max = 160) { return typeof value === "string" ? value.trim().slice(0, max) : ""; }
+function normalizeUsn(raw) {
+  const cleaned = cleanText(raw, 80).toUpperCase().replace(/\s+/g, "");
+  const match = cleaned.match(/^(4CB\d{2}CS)0*(\d+)$/i);
+  if (match) {
+    const [, prefix, num] = match;
+    return `${prefix.toUpperCase()}${num.padStart(3, "0")}`;
+  }
+  return cleaned;
+}
 function distanceMetres(lat1, lon1, lat2, lon2) {
   const radians = (degrees) => degrees * Math.PI / 180;
   const dLat = radians(lat2 - lat1); const dLon = radians(lon2 - lon1);
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(radians(lat1)) * Math.cos(radians(lat2)) * Math.sin(dLon / 2) ** 2;
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
-function clampAccuracy(value) { return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0; }
+function clampAccuracy(value) { return Number.isFinite(value) ? Math.max(0, Math.min(MAX_ACCURACY_ALLOWANCE, value)) : 0; }
 function isValidCoordinates(lat, lon) {
   return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
 }
 function evaluateProximity(lat1, lon1, acc1, lat2, lon2, acc2) {
   const distance = distanceMetres(lat1, lon1, lat2, lon2);
-  const allowance = Math.min(100, clampAccuracy(acc1) + clampAccuracy(acc2));
+  const allowance = Math.min(MAX_ACCURACY_ALLOWANCE, clampAccuracy(acc1) + clampAccuracy(acc2));
   const estimatedDistance = Math.max(0, distance - allowance);
   return {
     distance: Math.round(distance),
@@ -311,8 +323,8 @@ app.post("/api/attendance/verify", (req, res) => {
   const session = db.prepare("SELECT * FROM attendance_sessions WHERE token = ?").get(token);
   if (!session) return jsonError(res, 404, "Invalid attendance QR code.");
   if (Date.now() > session.expires_at) return jsonError(res, 410, "QR code expired. Attendance not marked.");
-  const registeredStudent = db.prepare("SELECT student_id FROM students WHERE student_id = ? COLLATE NOCASE").get(rawStudentId);
-  const studentId = registeredStudent ? registeredStudent.student_id : rawStudentId;
+  const registeredStudent = db.prepare("SELECT student_id FROM students WHERE student_id = ? COLLATE NOCASE OR student_id = ? COLLATE NOCASE").get(rawStudentId, normalizeUsn(rawStudentId));
+  const studentId = registeredStudent ? registeredStudent.student_id : (normalizeUsn(rawStudentId) || rawStudentId);
   const proximity = evaluateProximity(session.teacher_lat, session.teacher_lon, session.teacher_accuracy, studentLat, studentLon, req.body.studentAccuracy);
   if (!proximity.sameLocation) return res.status(403).json({ success: false, message: "You are outside the class check-in area. Attendance not marked.", distance: proximity.distance, estimatedDistance: proximity.estimatedDistance, accuracyAllowance: proximity.allowance });
   const deviceHash = createHash("sha256").update(deviceId).digest("hex");
@@ -335,18 +347,42 @@ app.post("/api/attendance/verify", (req, res) => {
   }
 });
 app.get("/api/attendance/:token/records", requireTeacher, (req, res) => {
-  const session = db.prepare("SELECT class_name, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
+  const session = db.prepare("SELECT token, class_name AS className, teacher_name AS teacherName, created_at AS createdAt, expires_at AS expiresAt FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
-  const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  const roster = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.class_name);
+  const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance, marked_by AS markedBy FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
+  const roster = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.className);
   const presentSet = new Set(records.map((row) => row.studentId.toUpperCase()));
   const absentees = roster.filter((student) => !presentSet.has(student.studentId.toUpperCase())).map((student) => student.studentId);
-  res.json({ records, absentees, registeredCount: roster.length, expiresAt: session.expires_at });
+  res.json({ records, absentees, registeredCount: roster.length, expiresAt: session.expiresAt, session });
+});
+app.post("/api/teacher/attendance/:token/mark", requireTeacher, (req, res) => {
+  const session = db.prepare("SELECT token, class_name FROM attendance_sessions WHERE token = ?").get(req.params.token);
+  if (!session) return jsonError(res, 404, "Attendance session not found.");
+  const rawStudentId = cleanText(req.body.studentId, 80);
+  if (!rawStudentId) return jsonError(res, 400, "Enter a student ID to mark attendance.");
+  const registeredStudent = db.prepare("SELECT student_id FROM students WHERE student_id = ? COLLATE NOCASE").get(rawStudentId);
+  const studentId = registeredStudent ? registeredStudent.student_id : rawStudentId;
+  const existing = db.prepare("SELECT 1 FROM attendance_records WHERE session_token = ? AND student_id = ? COLLATE NOCASE").get(req.params.token, studentId);
+  if (existing) return jsonError(res, 409, `${studentId} is already marked present for this session.`);
+  const markedAt = new Date().toISOString();
+  db.prepare("INSERT INTO attendance_records(session_token, student_id, marked_at, distance, marked_by) VALUES (?, ?, ?, 0, 'teacher')")
+    .run(req.params.token, studentId, markedAt);
+  res.json({ success: true, message: `${studentId} marked present by teacher.`, studentId, markedAt, markedBy: "teacher" });
+});
+app.delete("/api/teacher/attendance/:token/mark/:studentId", requireTeacher, (req, res) => {
+  const session = db.prepare("SELECT token FROM attendance_sessions WHERE token = ?").get(req.params.token);
+  if (!session) return jsonError(res, 404, "Attendance session not found.");
+  const studentId = cleanText(req.params.studentId, 80);
+  if (!studentId) return jsonError(res, 400, "Student ID is required.");
+  const result = db.prepare("DELETE FROM attendance_records WHERE session_token = ? AND student_id = ? COLLATE NOCASE").run(req.params.token, studentId);
+  db.prepare("DELETE FROM attendance_device_claims WHERE session_token = ? AND student_id = ? COLLATE NOCASE").run(req.params.token, studentId);
+  if (!result.changes) return jsonError(res, 404, "Attendance record not found for this student.");
+  res.json({ success: true, message: `${studentId} removed from this session's attendance.` });
 });
 app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT token, teacher_name, class_name, created_at, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
-  const rows = db.prepare("SELECT student_id, marked_at, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
+  const rows = db.prepare("SELECT student_id, marked_at, distance, marked_by FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
   const roster = db.prepare("SELECT student_id FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.class_name);
   const recordById = new Map(rows.map((row) => [row.student_id.toUpperCase(), row]));
   const combined = roster.length
@@ -354,16 +390,16 @@ app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
         ...roster.map((student) => {
           const rec = recordById.get(student.student_id.toUpperCase());
           return rec
-            ? { student_id: student.student_id, status: "Present", marked_at: rec.marked_at, distance: rec.distance }
-            : { student_id: student.student_id, status: "Absent", marked_at: "", distance: "" };
+            ? { student_id: student.student_id, status: "Present", marked_by: rec.marked_by || "student", marked_at: rec.marked_at, distance: rec.distance }
+            : { student_id: student.student_id, status: "Absent", marked_by: "", marked_at: "", distance: "" };
         }),
         ...rows.filter((row) => !roster.some((student) => student.student_id.toUpperCase() === row.student_id.toUpperCase()))
-          .map((row) => ({ student_id: row.student_id, status: "Present", marked_at: row.marked_at, distance: row.distance })),
+          .map((row) => ({ student_id: row.student_id, status: "Present", marked_by: row.marked_by || "student", marked_at: row.marked_at, distance: row.distance })),
       ]
-    : rows.map((row) => ({ student_id: row.student_id, status: "Present", marked_at: row.marked_at, distance: row.distance }));
-  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "status", "marked_at", "distance_metres"];
+    : rows.map((row) => ({ student_id: row.student_id, status: "Present", marked_by: row.marked_by || "student", marked_at: row.marked_at, distance: row.distance }));
+  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "status", "marked_by", "marked_at", "distance_metres"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const csv = [columns.join(","), ...combined.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.status, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
+  const csv = [columns.join(","), ...combined.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.status, row.marked_by, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${session.class_name.replace(/[^a-z0-9]+/gi, "-")}-attendance.csv` }).send(csv);
 });
 function parseIsoDateBoundary(dateText, endOfDay, tzOffsetMinutes) {
@@ -723,7 +759,7 @@ app.get("/api/emergency/active", (_req, res) => {
 
 // Student submits a self-reported safety confirmation
 app.post("/api/emergency/:id/safe", (req, res) => {
-  const studentId = cleanText(req.body.studentId, 80);
+  const studentId = normalizeUsn(req.body.studentId);
 
   if (!studentId) {
     return jsonError(res, 400, "Enter your Student ID.");
