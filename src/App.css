@@ -480,3 +480,10 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .absentee-mark-btn span { color: #126346; }
 .absentee-mark-btn:hover:not(:disabled) { background: #edf6f0; border-color: #b7dec7; color: #19251f; }
 .history-session-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.inline-rollcall-btn { margin-left: 8px; vertical-align: middle; }
+.history-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 10px 0 14px; }
+.history-filter-row .history-filter-tabs { margin: 0; }
+.history-session-picker { display: flex; align-items: center; gap: 8px; color: #56685c; font-size: 11px; font-weight: 700; }
+.history-session-picker select { padding: 7px 10px; border: 1px solid #e1e7e2; border-radius: 8px; background: #fcfdfc; color: #43584a; font-size: 11px; }
+.session-mark-cell { display: inline-flex; align-items: center; gap: 6px; }
+.session-mark-cell .teacher-marked-tag { margin-left: 0; }

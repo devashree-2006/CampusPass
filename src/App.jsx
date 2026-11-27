@@ -82,6 +82,7 @@ function App() {
   const [historyEndDate, setHistoryEndDate] = useState(() => formatLocalIsoDate(new Date()))
   const [historyFilter, setHistoryFilter] = useState('all')
   const [historyReport, setHistoryReport] = useState(null)
+  const [selectedHistorySessionToken, setSelectedHistorySessionToken] = useState('')
   const [historyLoading, setHistoryLoading] = useState(false)
   const [cameraZoom, setCameraZoom] = useState(1)
   const [cameraZoomRange, setCameraZoomRange] = useState(null)
@@ -189,6 +190,51 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
       setMessage({ type: 'success', text: data.message })
       await loadAttendees(session.token)
       if (historyReport) void loadAttendanceHistory()
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setManualMarkBusy(false)
+    }
+  }
+
+  async function startManualRollCall() {
+    if (!className.trim()) {
+      setMessage({ type: 'error', text: 'Select or enter a class (e.g. CSE 3A) first.' })
+      return
+    }
+    setManualMarkBusy(true); setMessage(null)
+    try {
+      const data = await request('/api/teacher/attendance/manual-session', {
+        method: 'POST',
+        body: JSON.stringify({ teacherName: teacherName.trim(), className: className.trim() }),
+      }, teacherToken)
+      setSession({ token: data.token, className: data.className, teacherName: data.teacherName, expiresAt: data.expiresAt })
+      setAttendanceQr(null)
+      await loadAttendees(data.token)
+      setMessage({ type: 'success', text: data.message })
+      if (historyReport) await loadAttendanceHistory()
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setManualMarkBusy(false)
+    }
+  }
+
+  async function markStudentForSession(token, studentIdToMark, markPresent) {
+    if (!token || !studentIdToMark) return
+    setManualMarkBusy(true); setMessage(null)
+    try {
+      const data = markPresent
+        ? await request(`/api/teacher/attendance/${encodeURIComponent(token)}/mark`, {
+            method: 'POST',
+            body: JSON.stringify({ studentId: studentIdToMark }),
+          }, teacherToken)
+        : await request(`/api/teacher/attendance/${encodeURIComponent(token)}/mark/${encodeURIComponent(studentIdToMark)}`, {
+            method: 'DELETE',
+          }, teacherToken)
+      setMessage({ type: 'success', text: data.message })
+      if (session?.token === token) await loadAttendees(token)
+      if (historyReport) await loadAttendanceHistory()
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     } finally {
@@ -640,7 +686,13 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     }
     setHistoryLoading(true); setMessage(null)
     try {
-      setHistoryReport(await request(`/api/teacher/attendance-summary?${buildAttendanceHistoryQuery().toString()}`, {}, teacherToken))
+      const report = await request(`/api/teacher/attendance-summary?${buildAttendanceHistoryQuery().toString()}`, {}, teacherToken)
+      setHistoryReport(report)
+      setSelectedHistorySessionToken((prev) => (
+        report.sessions?.some((item) => item.token === prev)
+          ? prev
+          : (report.sessions?.[report.sessions.length - 1]?.token || '')
+      ))
       setHistoryFilter('all')
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setHistoryLoading(false) }
@@ -947,7 +999,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
                     </button>
                   )}
                 </div>
-              ))}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in, or mark students manually above…' : 'Start a session (or open one from history below) to view and mark students.'}</div>}
+              ))}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in, or mark students manually above…' : <><span>Start a session above, open one from history, or open a manual roll call for the selected class.</span> <button type="button" className="secondary-button inline-rollcall-btn" disabled={manualMarkBusy || !className.trim()} onClick={() => void startManualRollCall()}>+ Open manual roll call</button></>}</div>}
               {session && registeredCount > 0 && absentees.length > 0 && (
                 <div className="live-absentees-box">
                   <div className="absentees-header">
@@ -1008,13 +1060,64 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
                 <strong>{historyReport.zeroAttendanceCount || 0}</strong><span>at 0% (absent)</span>
               </div>
               {historyReport.students.length > 0 && (
-                <div className="history-filter-tabs" role="group" aria-label="Filter students">
-                  <button type="button" className={historyFilter === 'all' ? 'active' : ''} onClick={() => setHistoryFilter('all')}>All ({historyReport.students.length})</button>
-                  <button type="button" className={historyFilter === 'absent' ? 'active' : ''} onClick={() => setHistoryFilter('absent')}>0% Absentees ({historyReport.zeroAttendanceCount || 0})</button>
-                  <button type="button" className={historyFilter === 'low' ? 'active' : ''} onClick={() => setHistoryFilter('low')}>Below 75% ({historyReport.students.filter((s) => s.percentage < 75).length})</button>
+                <div className="history-filter-row">
+                  <div className="history-filter-tabs" role="group" aria-label="Filter students">
+                    <button type="button" className={historyFilter === 'all' ? 'active' : ''} onClick={() => setHistoryFilter('all')}>All ({historyReport.students.length})</button>
+                    <button type="button" className={historyFilter === 'absent' ? 'active' : ''} onClick={() => setHistoryFilter('absent')}>0% Absentees ({historyReport.zeroAttendanceCount || 0})</button>
+                    <button type="button" className={historyFilter === 'low' ? 'active' : ''} onClick={() => setHistoryFilter('low')}>Below 75% ({historyReport.students.filter((s) => s.percentage < 75).length})</button>
+                  </div>
+                  {historyReport.sessions.length > 0 ? (
+                    <label className="history-session-picker">
+                      Mark for session
+                      <select
+                        value={selectedHistorySessionToken}
+                        onChange={(e) => setSelectedHistorySessionToken(e.target.value)}
+                      >
+                        {historyReport.sessions.map((item, idx) => (
+                          <option key={item.token} value={item.token}>
+                            Session {idx + 1} · {new Date(item.createdAt).toLocaleString()}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : (
+                    <button type="button" className="secondary-button" disabled={manualMarkBusy} onClick={() => void startManualRollCall()}>
+                      + Create roll-call session to mark students
+                    </button>
+                  )}
                 </div>
               )}
-              {filteredHistoryStudents.length ? <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Absent</th><th>Attendance</th><th>Notify parent</th></tr></thead><tbody>{filteredHistoryStudents.map((student) => <tr key={student.studentId}><td>{student.studentId}</td><td>{student.attendedSessions} / {student.totalSessions}</td><td>{student.absentSessions}</td><td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td><td className="parent-share-cell"><button type="button" className="mini-share-btn whatsapp" onClick={() => shareOnWhatsApp(buildStudentParentMessage(historyReport, student))}>WhatsApp</button><button type="button" className="mini-share-btn gmail" onClick={() => shareOnGmail(`${student.studentId} · ${historyReport.className} Attendance`, buildStudentParentMessage(historyReport, student))}>Gmail</button></td></tr>)}</tbody></table></div> : <div className="roster-empty">No matching students for this class and period.</div>}
+              {filteredHistoryStudents.length ? (() => {
+                const selectedSessionIndex = historyReport.sessions.findIndex((item) => item.token === selectedHistorySessionToken)
+                const activeSessionIdx = selectedSessionIndex >= 0 ? selectedSessionIndex : historyReport.sessions.length - 1
+                const activeSessionToken = historyReport.sessions[activeSessionIdx]?.token || ''
+                return (
+                  <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Absent</th><th>Attendance</th>{activeSessionToken && <th>Mark attendance</th>}<th>Notify parent</th></tr></thead><tbody>{filteredHistoryStudents.map((student) => {
+                    const isPresentInSelected = activeSessionToken ? Boolean(student.attendance?.[activeSessionIdx]) : false
+                    return (
+                      <tr key={student.studentId}>
+                        <td>{student.studentId}</td>
+                        <td>{student.attendedSessions} / {student.totalSessions}</td>
+                        <td>{student.absentSessions}</td>
+                        <td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td>
+                        {activeSessionToken && (
+                          <td>
+                            {isPresentInSelected ? (
+                              <span className="session-mark-cell">
+                                <em className="teacher-marked-tag">✓ Present</em>
+                                <button type="button" className="mini-share-btn" disabled={manualMarkBusy} onClick={() => void markStudentForSession(activeSessionToken, student.studentId, false)}>Unmark</button>
+                              </span>
+                            ) : (
+                              <button type="button" className="mini-share-btn whatsapp" disabled={manualMarkBusy} onClick={() => void markStudentForSession(activeSessionToken, student.studentId, true)}>+ Mark present</button>
+                            )}
+                          </td>
+                        )}
+                        <td className="parent-share-cell"><button type="button" className="mini-share-btn whatsapp" onClick={() => shareOnWhatsApp(buildStudentParentMessage(historyReport, student))}>WhatsApp</button><button type="button" className="mini-share-btn gmail" onClick={() => shareOnGmail(`${student.studentId} · ${historyReport.className} Attendance`, buildStudentParentMessage(historyReport, student))}>Gmail</button></td>
+                      </tr>
+                    )
+                  })}</tbody></table></div>
+                )
+              })() : <div className="roster-empty">No matching students for this class and period.</div>}
               <div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.length ? historyReport.sessions.map((item, index) => <span className="history-session-row" key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins <button type="button" className="mini-share-btn" onClick={() => void openHistorySession(item)}>Manage / mark students</button></span>) : <span>No sessions held in this date range yet. Registered students are shown at 0%.</span>}</div>
               <div className="history-share-note">Use Share on WhatsApp or Share on Gmail for the whole class summary, or notify an individual student’s parent directly from any row.</div>
             </> : <div className="roster-empty">Select a class above (e.g. CSE 3A, CSE 3B, or CSE 3C) and load attendance for 15 days, 30 days, or a custom date range.</div>}

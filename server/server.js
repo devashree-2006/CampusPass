@@ -283,6 +283,23 @@ app.post("/api/admin/login", (req, res) => {
 app.post("/api/admin/logout", requireAdmin, (req, res) => {
   const token = req.get("authorization").replace(/^Bearer\s+/i, ""); adminSessions.delete(token); res.json({ success: true });
 });
+function findMatchingRegisteredClass(className) {
+  if (!className) return null;
+  const exact = db.prepare("SELECT DISTINCT class_name AS className FROM students WHERE class_name = ? COLLATE NOCASE").get(className);
+  if (exact) return exact.className;
+  const normalized = className.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!normalized) return null;
+  const allClasses = db.prepare("SELECT DISTINCT class_name AS className FROM students").all();
+  for (const row of allClasses) {
+    const code = row.className.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const suffix = code.replace(/^CSE/, "");
+    if (normalized === code || normalized === suffix || normalized.includes(code)) {
+      return row.className;
+    }
+  }
+  return null;
+}
+
 app.get("/api/teacher/classes", requireTeacher, (_req, res) => {
   const classes = db.prepare(`
     SELECT class_name AS className, COUNT(*) AS studentCount
@@ -346,11 +363,25 @@ app.post("/api/attendance/verify", (req, res) => {
     jsonError(res, 409, "This device or student ID has already been used for this session.");
   }
 });
+app.post("/api/teacher/attendance/manual-session", requireTeacher, (req, res) => {
+  const teacherName = cleanText(req.body.teacherName, 100) || req.teacher.username;
+  const rawClassName = cleanText(req.body.className, 100);
+  if (!rawClassName) return jsonError(res, 400, "Enter or select a class before opening roll call.");
+  const matchedClass = findMatchingRegisteredClass(rawClassName) || rawClassName;
+  const token = randomUUID();
+  const now = Date.now();
+  db.prepare(`INSERT INTO attendance_sessions(token, teacher_name, class_name, teacher_lat, teacher_lon, teacher_accuracy, expires_at, created_at) VALUES (?, ?, ?, 0, 0, 0, ?, ?)`)
+    .run(token, teacherName, matchedClass, now, new Date(now).toISOString());
+  res.json({ message: `Manual roll-call session created for ${matchedClass}.`, token, teacherName, className: matchedClass, expiresAt: now });
+});
 app.get("/api/attendance/:token/records", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT token, class_name AS className, teacher_name AS teacherName, created_at AS createdAt, expires_at AS expiresAt FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
   const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance, marked_by AS markedBy FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  const roster = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.className);
+  const rosterClass = findMatchingRegisteredClass(session.className);
+  const roster = rosterClass
+    ? db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(rosterClass)
+    : [];
   const presentSet = new Set(records.map((row) => row.studentId.toUpperCase()));
   const absentees = roster.filter((student) => !presentSet.has(student.studentId.toUpperCase())).map((student) => student.studentId);
   res.json({ records, absentees, registeredCount: roster.length, expiresAt: session.expiresAt, session });
@@ -383,7 +414,10 @@ app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT token, teacher_name, class_name, created_at, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
   const rows = db.prepare("SELECT student_id, marked_at, distance, marked_by FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  const roster = db.prepare("SELECT student_id FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.class_name);
+  const rosterClass = findMatchingRegisteredClass(session.class_name);
+  const roster = rosterClass
+    ? db.prepare("SELECT student_id FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(rosterClass)
+    : [];
   const recordById = new Map(rows.map((row) => [row.student_id.toUpperCase(), row]));
   const combined = roster.length
     ? [
@@ -414,8 +448,10 @@ function parseIsoDateBoundary(dateText, endOfDay, tzOffsetMinutes) {
 }
 function buildTeacherAttendanceReport(filters) {
   const { teacherName, className, days, startDate, endDate, since, until, rangeLabel } = filters;
+  const matchedRosterClass = findMatchingRegisteredClass(className);
+  const queryClassName = matchedRosterClass || className;
   const whereParts = ["s.class_name = ? COLLATE NOCASE", "s.created_at >= ?", "s.created_at <= ?"];
-  const params = [className, since, until];
+  const params = [queryClassName, since, until];
   if (teacherName) {
     whereParts.unshift("s.teacher_name = ? COLLATE NOCASE");
     params.unshift(teacherName);
@@ -426,7 +462,9 @@ function buildTeacherAttendanceReport(filters) {
     ORDER BY s.created_at`).all(...params);
   const records = sessions.length ? db.prepare(`SELECT session_token AS sessionToken, student_id AS studentId FROM attendance_records
     WHERE session_token IN (${sessions.map(() => "?").join(",")}) ORDER BY student_id`).all(...sessions.map((row) => row.token)) : [];
-  const registeredRows = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(className);
+  const registeredRows = matchedRosterClass
+    ? db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(matchedRosterClass)
+    : [];
   const canonicalByUpper = new Map();
   const attendanceByStudent = new Map();
   const registeredSet = new Set();
