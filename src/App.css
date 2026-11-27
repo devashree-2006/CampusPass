@@ -433,3 +433,37 @@ footer span:last-child { display: flex; align-items: center; gap: 7px; }
 .emergency-counts span {
   font-size: 0.85rem;
 }
+
+.class-quick-picks { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+.class-chip { padding: 6px 10px; border: 1px solid #dbe6dd; border-radius: 7px; background: #f8fbf9; color: #43584a; font-size: 11px; font-weight: 700; }
+.class-chip small { color: #7f9186; font-weight: 500; }
+.class-chip.active { border-color: #126346; background: #e9f5ee; color: #126346; }
+.live-absentees-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid #eef2ee; }
+.live-absentees-box strong { display: block; margin-bottom: 9px; color: #8c5338; font-size: 11px; }
+.absentee-chips { display: flex; flex-wrap: wrap; gap: 6px; max-height: 120px; overflow-y: auto; }
+.absentee-chips span { padding: 4px 8px; border-radius: 6px; background: #fff5ee; border: 1px solid #f2ddd0; color: #94573a; font-size: 10px; font-weight: 600; }
+.history-controls input[type="date"] { display: block; width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #e1e7e2; border-radius: 8px; background: #fcfdfc; color: #43584a; font-size: 12px; }
+.history-filter-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 14px; }
+.history-filter-tabs button { padding: 7px 11px; border: 1px solid #dfe8e1; border-radius: 7px; background: #fff; color: #5b6d61; font-size: 11px; font-weight: 700; }
+.history-filter-tabs button.active { border-color: #126346; background: #edf6f0; color: #126346; }
+.whatsapp-button { background: #1a8955; }
+.whatsapp-button:hover:not(:disabled) { background: #146f44; }
+.gmail-button { border-color: #d6e2ef; color: #2b5a8a; }
+.gmail-button:hover { background: #f2f7fc; }
+.parent-share-cell { display: flex; gap: 6px; }
+.mini-share-btn { padding: 5px 8px; border-radius: 6px; border: 1px solid #dbe5dd; background: #fff; font-size: 10px; font-weight: 700; }
+.mini-share-btn.whatsapp { border-color: #cbe7d7; color: #187a4b; background: #f3fbf6; }
+.mini-share-btn.gmail { border-color: #d3e1ef; color: #2b5a8a; background: #f4f8fc; }
+.visitor-gps-box { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; padding: 12px 14px; border: 1px solid #dce8df; border-radius: 9px; background: #f6faf7; }
+.visitor-gps-box strong, .visitor-gps-box small { display: block; }
+.visitor-gps-box strong { color: #274a38; font-size: 11px; }
+.visitor-gps-box small { margin-top: 3px; color: #6c7e73; font-size: 10px; }
+.visitor-gps-box .secondary-button { flex-shrink: 0; }
+.approval-queue-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gps-match-badge { display: inline-block; margin-top: 6px !important; padding: 3px 8px; border-radius: 6px; font-size: 10px !important; font-weight: 700; }
+.gps-match-badge.match { background: #eaf6ee; color: #1f744c !important; }
+.gps-match-badge.mismatch { background: #fff2eb; color: #a8522d !important; }
+.gps-match-badge.pending { background: #f3f6f4; color: #607267 !important; }
+@media (max-width: 760px) {
+  .visitor-gps-box { flex-direction: column; align-items: stretch; }
+}

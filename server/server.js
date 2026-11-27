@@ -13,6 +13,12 @@ mkdirSync(path.dirname(path.resolve(databasePath)), { recursive: true });
 const db = new DatabaseSync(databasePath, { timeout: 5000 });
 db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
 db.exec(`
+  CREATE TABLE IF NOT EXISTS students (
+    student_id TEXT PRIMARY KEY,
+    class_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS students_class_idx ON students(class_name);
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS guards (
     id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
@@ -37,17 +43,22 @@ db.exec(`
     pass_id TEXT PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT NOT NULL, email TEXT NOT NULL,
     organization TEXT NOT NULL, host_name TEXT NOT NULL, host_department TEXT NOT NULL,
     purpose TEXT NOT NULL, vehicle_number TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'outside',
+    visitor_lat REAL, visitor_lon REAL, visitor_accuracy REAL, location_captured_at TEXT,
     valid_from INTEGER NOT NULL, valid_until INTEGER NOT NULL, created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS visitor_approvals (
     pass_id TEXT PRIMARY KEY REFERENCES visitors(pass_id), token_hash TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+    guard_username TEXT, guard_lat REAL, guard_lon REAL, guard_accuracy REAL,
+    distance_metres REAL, estimated_distance REAL, location_verified INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, decided_at TEXT
   );
   CREATE TABLE IF NOT EXISTS visitor_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, pass_id TEXT NOT NULL REFERENCES visitors(pass_id),
     guard_username TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('CHECK_IN','CHECK_OUT')),
-    scanned_at TEXT NOT NULL, latitude REAL, longitude REAL, qr_slot INTEGER NOT NULL, identity_verified INTEGER NOT NULL DEFAULT 0,
+    scanned_at TEXT NOT NULL, latitude REAL, longitude REAL, guard_accuracy REAL,
+    visitor_lat REAL, visitor_lon REAL, distance_metres REAL, estimated_distance REAL,
+    location_verified INTEGER NOT NULL DEFAULT 0, qr_slot INTEGER NOT NULL, identity_verified INTEGER NOT NULL DEFAULT 0,
     UNIQUE(pass_id, qr_slot)
   );
     CREATE INDEX IF NOT EXISTS visitor_events_time_idx ON visitor_events(scanned_at DESC);
@@ -71,8 +82,56 @@ db.exec(`
   );
 `);
 
-const eventColumns = db.prepare("PRAGMA table_info(visitor_events)").all().map((column) => column.name);
-if (!eventColumns.includes("identity_verified")) db.exec("ALTER TABLE visitor_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0");
+function ensureColumn(tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name);
+  if (!columns.includes(columnName)) db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+ensureColumn("visitors", "visitor_lat", "REAL");
+ensureColumn("visitors", "visitor_lon", "REAL");
+ensureColumn("visitors", "visitor_accuracy", "REAL");
+ensureColumn("visitors", "location_captured_at", "TEXT");
+
+ensureColumn("visitor_approvals", "guard_username", "TEXT");
+ensureColumn("visitor_approvals", "guard_lat", "REAL");
+ensureColumn("visitor_approvals", "guard_lon", "REAL");
+ensureColumn("visitor_approvals", "guard_accuracy", "REAL");
+ensureColumn("visitor_approvals", "distance_metres", "REAL");
+ensureColumn("visitor_approvals", "estimated_distance", "REAL");
+ensureColumn("visitor_approvals", "location_verified", "INTEGER NOT NULL DEFAULT 0");
+
+ensureColumn("visitor_events", "identity_verified", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("visitor_events", "guard_accuracy", "REAL");
+ensureColumn("visitor_events", "visitor_lat", "REAL");
+ensureColumn("visitor_events", "visitor_lon", "REAL");
+ensureColumn("visitor_events", "distance_metres", "REAL");
+ensureColumn("visitor_events", "estimated_distance", "REAL");
+ensureColumn("visitor_events", "location_verified", "INTEGER NOT NULL DEFAULT 0");
+
+function buildDefaultStudents() {
+  const rows = [];
+  for (let i = 1; i <= 58; i += 1) rows.push({ studentId: `4CB24CS${String(i).padStart(3, "0")}`, className: "CSE 3A" });
+  for (let i = 400; i <= 406; i += 1) rows.push({ studentId: `4CB25CS${String(i).padStart(3, "0")}`, className: "CSE 3A" });
+  for (let i = 59; i <= 122; i += 1) rows.push({ studentId: `4CB24CS${String(i).padStart(3, "0")}`, className: "CSE 3B" });
+  for (let i = 123; i <= 185; i += 1) rows.push({ studentId: `4CB24CS${String(i).padStart(3, "0")}`, className: "CSE 3C" });
+  return rows;
+}
+
+function seedDefaultStudents() {
+  const nowIso = new Date().toISOString();
+  const insert = db.prepare("INSERT OR IGNORE INTO students(student_id, class_name, created_at) VALUES (?, ?, ?)");
+  const students = buildDefaultStudents();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const student of students) insert.run(student.studentId, student.className, nowIso);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* transaction may have failed before BEGIN */ }
+    throw error;
+  }
+}
+
+seedDefaultStudents();
 
 const RADIUS_METRES = 50;
 const ATTENDANCE_QR_VALIDITY = 5 * 60 * 1000;
@@ -113,6 +172,20 @@ function distanceMetres(lat1, lon1, lat2, lon2) {
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 function clampAccuracy(value) { return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0; }
+function isValidCoordinates(lat, lon) {
+  return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+}
+function evaluateProximity(lat1, lon1, acc1, lat2, lon2, acc2) {
+  const distance = distanceMetres(lat1, lon1, lat2, lon2);
+  const allowance = Math.min(100, clampAccuracy(acc1) + clampAccuracy(acc2));
+  const estimatedDistance = Math.max(0, distance - allowance);
+  return {
+    distance: Math.round(distance),
+    allowance: Math.round(allowance),
+    estimatedDistance: Math.round(estimatedDistance),
+    sameLocation: estimatedDistance <= RADIUS_METRES,
+  };
+}
 function qrSignature(passId, slot) { return createHmac("sha256", qrSecret).update(`${passId}:${slot}`).digest("hex"); }
 function attendanceSignature(token, slot) { return createHmac("sha256", qrSecret).update(`attendance:${token}:${slot}`).digest("hex"); }
 function parseAttendanceQr(value) {
@@ -198,9 +271,18 @@ app.post("/api/admin/login", (req, res) => {
 app.post("/api/admin/logout", requireAdmin, (req, res) => {
   const token = req.get("authorization").replace(/^Bearer\s+/i, ""); adminSessions.delete(token); res.json({ success: true });
 });
+app.get("/api/teacher/classes", requireTeacher, (_req, res) => {
+  const classes = db.prepare(`
+    SELECT class_name AS className, COUNT(*) AS studentCount
+    FROM students
+    GROUP BY class_name
+    ORDER BY class_name
+  `).all();
+  res.json({ classes });
+});
 app.post("/api/attendance/start", requireTeacher, async (req, res) => {
   const { teacherLat, teacherLon } = req.body;
-  if (!Number.isFinite(teacherLat) || !Number.isFinite(teacherLon) || Math.abs(teacherLat) > 90 || Math.abs(teacherLon) > 180) return jsonError(res, 400, "Valid teacher location is required.");
+  if (!isValidCoordinates(teacherLat, teacherLon)) return jsonError(res, 400, "Valid teacher location is required.");
   try {
     const token = randomUUID(); const expiresAt = Date.now() + ATTENDANCE_QR_VALIDITY;
     const teacherName = cleanText(req.body.teacherName, 100); const className = cleanText(req.body.className, 100);
@@ -223,92 +305,185 @@ app.get("/api/attendance/:token/qr", async (req, res) => {
 });
 app.post("/api/attendance/verify", (req, res) => {
   const qr = parseAttendanceQr(req.body.payload); const token = qr?.token;
-  const { studentLat, studentLon } = req.body; const studentId = cleanText(req.body.studentId, 80);
+  const { studentLat, studentLon } = req.body; const rawStudentId = cleanText(req.body.studentId, 80);
   const deviceId = typeof req.body.deviceId === "string" ? req.body.deviceId : "";
-  if (!token || !studentId || !/^[a-f0-9-]{32,64}$/i.test(deviceId) || !Number.isFinite(studentLat) || !Number.isFinite(studentLon) || Math.abs(studentLat) > 90 || Math.abs(studentLon) > 180) return jsonError(res, 400, "Use a current QR, your student ID, and this device’s valid check-in key.");
+  if (!token || !rawStudentId || !/^[a-f0-9-]{32,64}$/i.test(deviceId) || !isValidCoordinates(studentLat, studentLon)) return jsonError(res, 400, "Use a current QR, your student ID, and this device’s valid check-in key.");
   const session = db.prepare("SELECT * FROM attendance_sessions WHERE token = ?").get(token);
   if (!session) return jsonError(res, 404, "Invalid attendance QR code.");
   if (Date.now() > session.expires_at) return jsonError(res, 410, "QR code expired. Attendance not marked.");
-  const distance = distanceMetres(session.teacher_lat, session.teacher_lon, studentLat, studentLon);
-  const allowance = Math.min(100, session.teacher_accuracy + clampAccuracy(req.body.studentAccuracy));
-  const estimatedDistance = Math.max(0, distance - allowance);
-  if (estimatedDistance > RADIUS_METRES) return res.status(403).json({ success: false, message: "You are outside the class check-in area. Attendance not marked.", distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance), accuracyAllowance: Math.round(allowance) });
+  const registeredStudent = db.prepare("SELECT student_id FROM students WHERE student_id = ? COLLATE NOCASE").get(rawStudentId);
+  const studentId = registeredStudent ? registeredStudent.student_id : rawStudentId;
+  const proximity = evaluateProximity(session.teacher_lat, session.teacher_lon, session.teacher_accuracy, studentLat, studentLon, req.body.studentAccuracy);
+  if (!proximity.sameLocation) return res.status(403).json({ success: false, message: "You are outside the class check-in area. Attendance not marked.", distance: proximity.distance, estimatedDistance: proximity.estimatedDistance, accuracyAllowance: proximity.allowance });
   const deviceHash = createHash("sha256").update(deviceId).digest("hex");
   const deviceClaim = db.prepare("SELECT student_id FROM attendance_device_claims WHERE session_token = ? AND device_hash = ?").get(token, deviceHash);
-  if (deviceClaim && deviceClaim.student_id !== studentId) return jsonError(res, 403, "This device is already linked to a different student for this session.");
-  const studentClaim = db.prepare("SELECT device_hash FROM attendance_device_claims WHERE session_token = ? AND student_id = ?").get(token, studentId);
+  if (deviceClaim && deviceClaim.student_id.toUpperCase() !== studentId.toUpperCase()) return jsonError(res, 403, "This device is already linked to a different student for this session.");
+  const studentClaim = db.prepare("SELECT device_hash FROM attendance_device_claims WHERE session_token = ? AND student_id = ? COLLATE NOCASE").get(token, studentId);
   if (studentClaim && studentClaim.device_hash !== deviceHash) return jsonError(res, 409, "This student ID has already checked in from another device for this session.");
-  const marked = db.prepare("SELECT 1 FROM attendance_records WHERE session_token = ? AND student_id = ?").get(token, studentId);
+  const marked = db.prepare("SELECT 1 FROM attendance_records WHERE session_token = ? AND student_id = ? COLLATE NOCASE").get(token, studentId);
   if (marked) return jsonError(res, 409, "Attendance is already marked for this student in this session.");
   const markedAt = new Date().toISOString();
   try {
     db.exec("BEGIN IMMEDIATE");
     db.prepare("INSERT INTO attendance_device_claims(session_token, device_hash, student_id, created_at) VALUES (?, ?, ?, ?)").run(token, deviceHash, studentId, markedAt);
-    db.prepare("INSERT INTO attendance_records(session_token, student_id, marked_at, distance) VALUES (?, ?, ?, ?)").run(token, studentId, markedAt, Math.round(distance));
+    db.prepare("INSERT INTO attendance_records(session_token, student_id, marked_at, distance) VALUES (?, ?, ?, ?)").run(token, studentId, markedAt, proximity.distance);
     db.exec("COMMIT");
-    res.json({ success: true, message: "Attendance marked successfully for this device.", studentId, distance: Math.round(distance), estimatedDistance: Math.round(estimatedDistance) });
+    res.json({ success: true, message: "Attendance marked successfully for this device.", studentId, distance: proximity.distance, estimatedDistance: proximity.estimatedDistance });
   } catch {
     try { db.exec("ROLLBACK"); } catch { /* transaction may have failed before BEGIN */ }
     jsonError(res, 409, "This device or student ID has already been used for this session.");
   }
 });
 app.get("/api/attendance/:token/records", requireTeacher, (req, res) => {
-  const session = db.prepare("SELECT expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
+  const session = db.prepare("SELECT class_name, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
   const records = db.prepare("SELECT student_id AS studentId, marked_at AS markedAt, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  res.json({ records, expiresAt: session.expires_at });
+  const roster = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.class_name);
+  const presentSet = new Set(records.map((row) => row.studentId.toUpperCase()));
+  const absentees = roster.filter((student) => !presentSet.has(student.studentId.toUpperCase())).map((student) => student.studentId);
+  res.json({ records, absentees, registeredCount: roster.length, expiresAt: session.expires_at });
 });
 app.get("/api/teacher/attendance/:token.csv", requireTeacher, (req, res) => {
   const session = db.prepare("SELECT token, teacher_name, class_name, created_at, expires_at FROM attendance_sessions WHERE token = ?").get(req.params.token);
   if (!session) return jsonError(res, 404, "Attendance session not found.");
   const rows = db.prepare("SELECT student_id, marked_at, distance FROM attendance_records WHERE session_token = ? ORDER BY marked_at").all(req.params.token);
-  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "marked_at", "distance_metres"];
+  const roster = db.prepare("SELECT student_id FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(session.class_name);
+  const recordById = new Map(rows.map((row) => [row.student_id.toUpperCase(), row]));
+  const combined = roster.length
+    ? [
+        ...roster.map((student) => {
+          const rec = recordById.get(student.student_id.toUpperCase());
+          return rec
+            ? { student_id: student.student_id, status: "Present", marked_at: rec.marked_at, distance: rec.distance }
+            : { student_id: student.student_id, status: "Absent", marked_at: "", distance: "" };
+        }),
+        ...rows.filter((row) => !roster.some((student) => student.student_id.toUpperCase() === row.student_id.toUpperCase()))
+          .map((row) => ({ student_id: row.student_id, status: "Present", marked_at: row.marked_at, distance: row.distance })),
+      ]
+    : rows.map((row) => ({ student_id: row.student_id, status: "Present", marked_at: row.marked_at, distance: row.distance }));
+  const columns = ["class_name", "teacher_name", "session_started_at", "session_closed_at", "student_id", "status", "marked_at", "distance_metres"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const csv = [columns.join(","), ...rows.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
+  const csv = [columns.join(","), ...combined.map((row) => [session.class_name, session.teacher_name, session.created_at, new Date(session.expires_at).toISOString(), row.student_id, row.status, row.marked_at, row.distance].map(escape).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${session.class_name.replace(/[^a-z0-9]+/gi, "-")}-attendance.csv` }).send(csv);
 });
-function buildTeacherAttendanceReport(teacherName, className, days) {
-  const since = new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString();
+function parseIsoDateBoundary(dateText, endOfDay, tzOffsetMinutes) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) return null;
+  const [year, month, day] = dateText.split("-").map((part) => Number.parseInt(part, 10));
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
+  const baseMs = endOfDay
+    ? Date.UTC(year, month - 1, day, 23, 59, 59, 999)
+    : Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  return baseMs + tzOffsetMinutes * 60 * 1000;
+}
+function buildTeacherAttendanceReport(filters) {
+  const { teacherName, className, days, startDate, endDate, since, until, rangeLabel } = filters;
+  const whereParts = ["s.class_name = ? COLLATE NOCASE", "s.created_at >= ?", "s.created_at <= ?"];
+  const params = [className, since, until];
+  if (teacherName) {
+    whereParts.unshift("s.teacher_name = ? COLLATE NOCASE");
+    params.unshift(teacherName);
+  }
   const sessions = db.prepare(`SELECT s.token, s.teacher_name AS teacherName, s.class_name AS className, s.created_at AS createdAt,
     (SELECT COUNT(*) FROM attendance_records r WHERE r.session_token = s.token) AS attendanceCount
-    FROM attendance_sessions s WHERE s.teacher_name = ? COLLATE NOCASE AND s.class_name = ? COLLATE NOCASE AND s.created_at >= ?
-    ORDER BY s.created_at`).all(teacherName, className, since);
+    FROM attendance_sessions s WHERE ${whereParts.join(" AND ")}
+    ORDER BY s.created_at`).all(...params);
   const records = sessions.length ? db.prepare(`SELECT session_token AS sessionToken, student_id AS studentId FROM attendance_records
     WHERE session_token IN (${sessions.map(() => "?").join(",")}) ORDER BY student_id`).all(...sessions.map((row) => row.token)) : [];
+  const registeredRows = db.prepare("SELECT student_id AS studentId FROM students WHERE class_name = ? COLLATE NOCASE ORDER BY student_id").all(className);
+  const canonicalByUpper = new Map();
   const attendanceByStudent = new Map();
+  const registeredSet = new Set();
+  for (const row of registeredRows) {
+    canonicalByUpper.set(row.studentId.toUpperCase(), row.studentId);
+    registeredSet.add(row.studentId);
+    attendanceByStudent.set(row.studentId, new Set());
+  }
   for (const record of records) {
-    if (!attendanceByStudent.has(record.studentId)) attendanceByStudent.set(record.studentId, new Set());
-    attendanceByStudent.get(record.studentId).add(record.sessionToken);
+    const key = canonicalByUpper.get(record.studentId.toUpperCase()) || record.studentId;
+    if (!attendanceByStudent.has(key)) attendanceByStudent.set(key, new Set());
+    attendanceByStudent.get(key).add(record.sessionToken);
   }
   const students = [...attendanceByStudent.entries()].map(([studentId, attended]) => ({
     studentId,
+    isRegistered: registeredSet.has(studentId),
     attendedSessions: attended.size,
+    absentSessions: Math.max(0, sessions.length - attended.size),
     totalSessions: sessions.length,
     percentage: sessions.length ? Math.round(attended.size / sessions.length * 100) : 0,
     attendance: sessions.map((session) => attended.has(session.token)),
   })).sort((a, b) => a.studentId.localeCompare(b.studentId));
-  return { teacherName, className, days, since, totalSessions: sessions.length, totalCheckIns: records.length, sessions, students };
+  const zeroAttendanceCount = students.filter((student) => student.attendedSessions === 0).length;
+  return {
+    teacherName,
+    className,
+    days,
+    startDate,
+    endDate,
+    rangeLabel,
+    since,
+    until,
+    totalSessions: sessions.length,
+    totalCheckIns: records.length,
+    registeredCount: registeredSet.size,
+    zeroAttendanceCount,
+    sessions,
+    students,
+  };
 }
 function readTeacherReportFilters(req, res) {
-  const teacherName = cleanText(req.query.teacherName, 100); const className = cleanText(req.query.className, 100);
-  const requestedDays = Number.parseInt(req.query.days || "15", 10); const days = Number.isFinite(requestedDays) ? Math.min(30, Math.max(1, requestedDays)) : 15;
-  if (!teacherName || !className) { jsonError(res, 400, "Enter the teacher name and class to load attendance history."); return null; }
-  return { teacherName, className, days };
+  const teacherName = cleanText(req.query.teacherName, 100);
+  const className = cleanText(req.query.className, 100);
+  if (!className) { jsonError(res, 400, "Enter or select a class to load attendance history."); return null; }
+  const startDate = cleanText(req.query.startDate, 20);
+  const endDate = cleanText(req.query.endDate, 20);
+  const tzOffsetRaw = Number.parseInt(req.query.tzOffset || "0", 10);
+  const tzOffset = Number.isFinite(tzOffsetRaw) && Math.abs(tzOffsetRaw) <= 840 ? tzOffsetRaw : 0;
+  if (startDate || endDate) {
+    if (!startDate || !endDate) { jsonError(res, 400, "Select both a start date and an end date."); return null; }
+    const sinceMs = parseIsoDateBoundary(startDate, false, tzOffset);
+    const untilMs = parseIsoDateBoundary(endDate, true, tzOffset);
+    if (sinceMs === null || untilMs === null) { jsonError(res, 400, "Enter valid dates in YYYY-MM-DD format."); return null; }
+    if (sinceMs > untilMs) { jsonError(res, 400, "Start date must be on or before end date."); return null; }
+    return {
+      teacherName,
+      className,
+      days: null,
+      startDate,
+      endDate,
+      since: new Date(sinceMs).toISOString(),
+      until: new Date(untilMs).toISOString(),
+      rangeLabel: `${startDate} to ${endDate}`,
+    };
+  }
+  const requestedDays = Number.parseInt(req.query.days || "15", 10);
+  const days = Number.isFinite(requestedDays) ? Math.min(365, Math.max(1, requestedDays)) : 15;
+  return {
+    teacherName,
+    className,
+    days,
+    startDate: null,
+    endDate: null,
+    since: new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString(),
+    until: new Date().toISOString(),
+    rangeLabel: `Last ${days} days`,
+  };
 }
 app.get("/api/teacher/attendance-summary", requireTeacher, (req, res) => {
   const filters = readTeacherReportFilters(req, res); if (!filters) return;
-  res.json(buildTeacherAttendanceReport(filters.teacherName, filters.className, filters.days));
+  res.json(buildTeacherAttendanceReport(filters));
 });
 app.get("/api/teacher/attendance-range.csv", requireTeacher, (req, res) => {
   const filters = readTeacherReportFilters(req, res); if (!filters) return;
-  const report = buildTeacherAttendanceReport(filters.teacherName, filters.className, filters.days);
+  const report = buildTeacherAttendanceReport(filters);
   const sessions = report.sessions;
-  const columns = ["student_id", "classes_held", "classes_attended", "attendance_percentage", ...sessions.map((row, index) => `session_${index + 1}_${row.createdAt.slice(0, 10)}`)];
+  const columns = ["student_id", "classes_held", "classes_attended", "classes_absent", "attendance_percentage", ...sessions.map((row, index) => `session_${index + 1}_${row.createdAt.slice(0, 10)}`)];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  const rows = report.students.map((student) => [student.studentId, report.totalSessions, student.attendedSessions, student.percentage, ...student.attendance.map((present) => present ? "Present" : "Absent")].map(escape).join(","));
+  const rows = report.students.map((student) => [student.studentId, report.totalSessions, student.attendedSessions, student.absentSessions, student.percentage, ...student.attendance.map((present) => present ? "Present" : "Absent")].map(escape).join(","));
   const csv = [columns.join(","), ...rows].join("\r\n");
   const safeClass = filters.className.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");
-  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${safeClass}-${filters.days}-day-attendance.csv` }).send(csv);
+  const rangeSlug = filters.startDate && filters.endDate ? `${filters.startDate}-to-${filters.endDate}` : `${filters.days}-day`;
+  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=campuspass-${safeClass}-${rangeSlug}-attendance.csv` }).send(csv);
 });
 
 app.post("/api/visitors", (req, res) => {
@@ -320,18 +495,31 @@ app.post("/api/visitors", (req, res) => {
   if (!visitor.fullName || !visitor.phone || !visitor.email || !visitor.organization || !visitor.hostName || !visitor.hostDepartment || !visitor.purpose) return jsonError(res, 400, "Complete all required visitor and host details.");
   if (!/^[+0-9][0-9 +()-]{6,30}$/.test(visitor.phone)) return jsonError(res, 400, "Enter a valid phone number.");
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(visitor.email)) return jsonError(res, 400, "Enter a valid email address.");
+  const { visitorLat, visitorLon } = req.body;
+  if (!isValidCoordinates(visitorLat, visitorLon)) return jsonError(res, 400, "Valid GPS location is required to register as a visitor.");
+  const visitorAccuracy = clampAccuracy(req.body.visitorAccuracy);
   const passId = randomBytes(24).toString("base64url"); const approvalToken = randomBytes(32).toString("base64url");
   const tokenHash = createHash("sha256").update(approvalToken).digest("hex");
-  const now = Date.now(); const validUntil = now + VISITOR_VALIDITY_MS;
-  db.prepare(`INSERT INTO visitors(pass_id, full_name, phone, email, organization, host_name, host_department, purpose, vehicle_number, valid_from, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(passId, visitor.fullName, visitor.phone, visitor.email, visitor.organization, visitor.hostName, visitor.hostDepartment, visitor.purpose, visitor.vehicleNumber, now, validUntil, new Date(now).toISOString());
-  db.prepare("INSERT INTO visitor_approvals(pass_id, token_hash, status, created_at) VALUES (?, ?, 'pending', ?)").run(passId, tokenHash, new Date(now).toISOString());
-  res.status(201).json({ passId, visitor, validUntil });
+  const now = Date.now(); const validUntil = now + VISITOR_VALIDITY_MS; const nowIso = new Date(now).toISOString();
+  db.prepare(`INSERT INTO visitors(pass_id, full_name, phone, email, organization, host_name, host_department, purpose, vehicle_number, visitor_lat, visitor_lon, visitor_accuracy, location_captured_at, valid_from, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(passId, visitor.fullName, visitor.phone, visitor.email, visitor.organization, visitor.hostName, visitor.hostDepartment, visitor.purpose, visitor.vehicleNumber, visitorLat, visitorLon, visitorAccuracy, nowIso, now, validUntil, nowIso);
+  db.prepare("INSERT INTO visitor_approvals(pass_id, token_hash, status, created_at) VALUES (?, ?, 'pending', ?)").run(passId, tokenHash, nowIso);
+  res.status(201).json({ passId, visitor, validUntil, location: { lat: visitorLat, lon: visitorLon, accuracy: visitorAccuracy } });
+});
+app.post("/api/visitors/:passId/location", (req, res) => {
+  const { visitorLat, visitorLon } = req.body;
+  if (!isValidCoordinates(visitorLat, visitorLon)) return jsonError(res, 400, "Valid visitor GPS coordinates are required.");
+  const visitorAccuracy = clampAccuracy(req.body.visitorAccuracy);
+  const nowIso = new Date().toISOString();
+  const result = db.prepare("UPDATE visitors SET visitor_lat = ?, visitor_lon = ?, visitor_accuracy = ?, location_captured_at = ? WHERE pass_id = ?")
+    .run(visitorLat, visitorLon, visitorAccuracy, nowIso, req.params.passId);
+  if (!result.changes) return jsonError(res, 404, "Visitor pass not found.");
+  res.json({ success: true, locationCapturedAt: nowIso });
 });
 app.get("/api/visitors/:passId/qr", async (req, res) => {
-  const visitor = db.prepare("SELECT pass_id, full_name, host_name, host_department, purpose, organization, vehicle_number, status, valid_from, valid_until, (SELECT status FROM visitor_approvals WHERE pass_id = visitors.pass_id) AS approval_status FROM visitors WHERE pass_id = ?").get(req.params.passId);
+  const visitor = db.prepare("SELECT pass_id, full_name, host_name, host_department, purpose, organization, vehicle_number, status, visitor_lat, visitor_lon, visitor_accuracy, location_captured_at, valid_from, valid_until, (SELECT status FROM visitor_approvals WHERE pass_id = visitors.pass_id) AS approval_status FROM visitors WHERE pass_id = ?").get(req.params.passId);
   if (!visitor) return jsonError(res, 404, "Visitor pass not found.");
-  const visitorDetails = { fullName: visitor.full_name, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, organization: visitor.organization, vehicleNumber: visitor.vehicle_number, status: visitor.status, approvalStatus: visitor.approval_status, validUntil: visitor.valid_until };
+  const visitorDetails = { fullName: visitor.full_name, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, organization: visitor.organization, vehicleNumber: visitor.vehicle_number, status: visitor.status, approvalStatus: visitor.approval_status, validUntil: visitor.valid_until, locationCapturedAt: visitor.location_captured_at, hasLocation: isValidCoordinates(visitor.visitor_lat, visitor.visitor_lon) };
   if (visitor.approval_status !== "approved") return res.json({ qrCode: null, visitor: visitorDetails });
   if (Date.now() > visitor.valid_until && visitor.status !== "inside") return jsonError(res, 410, "This visitor pass has expired.");
   const slot = Math.floor(Date.now() / VISITOR_QR_SLOT_MS);
@@ -360,23 +548,49 @@ app.post("/api/security/logout", requireGuard, (req, res) => {
 });
 app.get("/api/security/dashboard", requireGuard, (req, res) => {
   const inside = db.prepare(`SELECT pass_id AS passId, full_name AS fullName, phone, email, organization, host_name AS hostName, host_department AS hostDepartment, purpose, vehicle_number AS vehicleNumber, created_at AS createdAt FROM visitors WHERE status = 'inside' ORDER BY full_name`).all();
-  const recentEvents = db.prepare(`SELECT e.id, e.event_type AS eventType, e.scanned_at AS scannedAt, e.guard_username AS guardUsername, e.latitude, e.longitude, e.identity_verified AS identityVerified, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.purpose, v.vehicle_number AS vehicleNumber FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC LIMIT 40`).all();
+  const recentEvents = db.prepare(`SELECT e.id, e.event_type AS eventType, e.scanned_at AS scannedAt, e.guard_username AS guardUsername, e.latitude, e.longitude, e.distance_metres AS distanceMetres, e.estimated_distance AS estimatedDistance, e.location_verified AS locationVerified, e.identity_verified AS identityVerified, v.full_name AS fullName, v.organization, v.host_name AS hostName, v.purpose, v.vehicle_number AS vehicleNumber FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC LIMIT 40`).all();
   const insideCount = db.prepare("SELECT COUNT(*) AS count FROM visitors WHERE status = 'inside'").get().count;
   const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
   const todayIso = todayStart.toISOString();
   const visitorsToday = db.prepare("SELECT COUNT(*) AS count FROM visitor_events WHERE scanned_at >= ? AND event_type = 'CHECK_IN'").get(todayIso).count;
   const attendanceToday = db.prepare("SELECT COUNT(*) AS count FROM attendance_records WHERE marked_at >= ?").get(todayIso).count;
   const pendingApprovals = db.prepare("SELECT COUNT(*) AS count FROM visitor_approvals WHERE status = 'pending'").get().count;
-  const approvalQueue = db.prepare(`SELECT v.pass_id AS passId, v.full_name AS fullName, v.phone, v.email, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.vehicle_number AS vehicleNumber, v.created_at AS createdAt, v.valid_until AS validUntil FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE a.status = 'pending' ORDER BY v.created_at`).all();
+  const approvalQueue = db.prepare(`SELECT v.pass_id AS passId, v.full_name AS fullName, v.phone, v.email, v.organization, v.host_name AS hostName, v.host_department AS hostDepartment, v.purpose, v.vehicle_number AS vehicleNumber, v.visitor_lat AS visitorLat, v.visitor_lon AS visitorLon, v.visitor_accuracy AS visitorAccuracy, v.location_captured_at AS locationCapturedAt, v.created_at AS createdAt, v.valid_until AS validUntil FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE a.status = 'pending' ORDER BY v.created_at`).all();
   const presentStudents = db.prepare("SELECT s.class_name AS className, s.teacher_name AS teacherName, r.student_id AS studentId, r.marked_at AS markedAt FROM attendance_records r JOIN attendance_sessions s ON s.token = r.session_token WHERE r.marked_at >= ? ORDER BY s.class_name, r.marked_at").all(todayIso);
   res.json({ inside, insideCount, recentEvents, guard: req.guard.username, visitorsToday, attendanceToday, pendingApprovals, approvalQueue, presentStudents });
 });
 app.post("/api/security/visitor-approvals/:passId", requireGuard, (req, res) => {
   const decision = req.body.decision;
   if (!["approved", "denied"].includes(decision)) return jsonError(res, 400, "Choose approve or decline.");
-  const result = db.prepare("UPDATE visitor_approvals SET status = ?, decided_at = ? WHERE pass_id = ? AND status = 'pending'").run(decision, new Date().toISOString(), req.params.passId);
+  const visitor = db.prepare("SELECT v.pass_id, v.visitor_lat, v.visitor_lon, v.visitor_accuracy, a.status FROM visitors v JOIN visitor_approvals a ON a.pass_id = v.pass_id WHERE v.pass_id = ?").get(req.params.passId);
+  if (!visitor) return jsonError(res, 404, "Visitor request not found.");
+  if (visitor.status !== "pending") return jsonError(res, 409, "This visitor request has already been decided or no longer exists.");
+  if (decision === "denied") {
+    const result = db.prepare("UPDATE visitor_approvals SET status = 'denied', decided_at = ?, guard_username = ? WHERE pass_id = ? AND status = 'pending'")
+      .run(new Date().toISOString(), req.guard.username, req.params.passId);
+    if (!result.changes) return jsonError(res, 409, "This visitor request has already been decided or no longer exists.");
+    return res.json({ approvalStatus: "denied" });
+  }
+  const { guardLat, guardLon } = req.body;
+  if (!isValidCoordinates(guardLat, guardLon)) return jsonError(res, 400, "Security GPS location is required to approve a visitor.");
+  if (!isValidCoordinates(visitor.visitor_lat, visitor.visitor_lon)) return jsonError(res, 400, "Visitor GPS location is missing for this pass.");
+  const guardAccuracy = clampAccuracy(req.body.guardAccuracy);
+  const proximity = evaluateProximity(visitor.visitor_lat, visitor.visitor_lon, visitor.visitor_accuracy, guardLat, guardLon, guardAccuracy);
+  if (!proximity.sameLocation) {
+    return res.status(403).json({
+      message: `Visitor and security are not in the same location (~${proximity.distance} m apart; ${proximity.estimatedDistance} m after GPS accuracy). Both must be within ${RADIUS_METRES} m to approve.`,
+      distance: proximity.distance,
+      estimatedDistance: proximity.estimatedDistance,
+      accuracyAllowance: proximity.allowance,
+    });
+  }
+  const result = db.prepare(`UPDATE visitor_approvals
+    SET status = 'approved', decided_at = ?, guard_username = ?, guard_lat = ?, guard_lon = ?, guard_accuracy = ?,
+        distance_metres = ?, estimated_distance = ?, location_verified = 1
+    WHERE pass_id = ? AND status = 'pending'`)
+    .run(new Date().toISOString(), req.guard.username, guardLat, guardLon, guardAccuracy, proximity.distance, proximity.estimatedDistance, req.params.passId);
   if (!result.changes) return jsonError(res, 409, "This visitor request has already been decided or no longer exists.");
-  res.json({ approvalStatus: decision });
+  res.json({ approvalStatus: "approved", distance: proximity.distance, estimatedDistance: proximity.estimatedDistance, locationVerified: true });
 });
 app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
   const now = Date.now(); const today = new Date(); today.setUTCHours(0, 0, 0, 0); const todayIso = today.toISOString();
@@ -427,8 +641,8 @@ app.post("/api/admin/assistant", requireAdmin, (req, res) => {
   res.json({ answer, metrics, source: "predefined SQLite reports" });
 });
 app.get("/api/security/events.csv", requireGuard, (_req, res) => {
-  const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
-  const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude", "identity_verified"];
+  const rows = db.prepare(`SELECT e.scanned_at, e.event_type, v.full_name, v.phone, v.email, v.organization, v.host_name, v.host_department, v.purpose, v.vehicle_number, e.guard_username, e.latitude, e.longitude, e.distance_metres, e.estimated_distance, e.location_verified, e.identity_verified FROM visitor_events e JOIN visitors v ON v.pass_id = e.pass_id ORDER BY e.id DESC`).all();
+  const columns = ["scanned_at", "event_type", "full_name", "phone", "email", "organization", "host_name", "host_department", "purpose", "vehicle_number", "guard_username", "latitude", "longitude", "distance_metres", "estimated_distance", "location_verified", "identity_verified"];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => escape(row[column])).join(","))].join("\r\n");
   res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=campuspass-visitor-log.csv" }).send(csv);
@@ -451,11 +665,23 @@ app.post("/api/security/scan", requireGuard, (req, res) => {
   const eventType = visitor.status === "inside" ? "CHECK_OUT" : "CHECK_IN";
   const identityVerified = req.body.identityVerified === true;
   if (eventType === "CHECK_IN" && !identityVerified) return jsonError(res, 403, "Confirm the visitor photo ID before checking them in.");
-  const latitude = Number.isFinite(req.body.latitude) && Math.abs(req.body.latitude) <= 90 ? req.body.latitude : null;
-  const longitude = Number.isFinite(req.body.longitude) && Math.abs(req.body.longitude) <= 180 ? req.body.longitude : null;
+  const { latitude, longitude } = req.body;
+  if (!isValidCoordinates(latitude, longitude)) return jsonError(res, 400, "Security GPS location is required when scanning a visitor pass.");
+  if (!isValidCoordinates(visitor.visitor_lat, visitor.visitor_lon)) return jsonError(res, 400, "Visitor GPS location is missing for this pass.");
+  const guardAccuracy = clampAccuracy(req.body.accuracy);
+  const proximity = evaluateProximity(visitor.visitor_lat, visitor.visitor_lon, visitor.visitor_accuracy, latitude, longitude, guardAccuracy);
+  if (!proximity.sameLocation) {
+    return res.status(403).json({
+      message: `Visitor and security are not in the same location (~${proximity.distance} m apart; ${proximity.estimatedDistance} m after GPS accuracy). Move within ${RADIUS_METRES} m to scan.`,
+      distance: proximity.distance,
+      estimatedDistance: proximity.estimatedDistance,
+      accuracyAllowance: proximity.allowance,
+    });
+  }
   try {
     db.exec("BEGIN IMMEDIATE");
-    db.prepare("INSERT INTO visitor_events(pass_id, guard_username, event_type, scanned_at, latitude, longitude, qr_slot, identity_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(visitor.pass_id, req.guard.username, eventType, new Date(now).toISOString(), latitude, longitude, data.slot, identityVerified ? 1 : 0);
+    db.prepare("INSERT INTO visitor_events(pass_id, guard_username, event_type, scanned_at, latitude, longitude, guard_accuracy, visitor_lat, visitor_lon, distance_metres, estimated_distance, location_verified, qr_slot, identity_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(visitor.pass_id, req.guard.username, eventType, new Date(now).toISOString(), latitude, longitude, guardAccuracy, visitor.visitor_lat, visitor.visitor_lon, proximity.distance, proximity.estimatedDistance, 1, data.slot, identityVerified ? 1 : 0);
     db.prepare("UPDATE visitors SET status = ? WHERE pass_id = ?").run(eventType === "CHECK_IN" ? "inside" : "outside", visitor.pass_id);
     db.exec("COMMIT");
   } catch (error) {
@@ -463,7 +689,16 @@ app.post("/api/security/scan", requireGuard, (req, res) => {
     if (String(error.message).includes("UNIQUE constraint failed")) return jsonError(res, 409, "This QR has already been scanned. Wait for the visitor's next rotating code.");
     return jsonError(res, 500, "Could not save the security scan.");
   }
-  res.json({ success: true, eventType, message: eventType === "CHECK_IN" ? "Visitor checked in." : "Visitor checked out.", visitor: { fullName: visitor.full_name, phone: visitor.phone, email: visitor.email, organization: visitor.organization, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, vehicleNumber: visitor.vehicle_number }, scannedAt: new Date(now).toISOString() });
+  res.json({
+    success: true,
+    eventType,
+    locationVerified: true,
+    distance: proximity.distance,
+    estimatedDistance: proximity.estimatedDistance,
+    message: eventType === "CHECK_IN" ? `Visitor checked in (~${proximity.distance} m apart).` : `Visitor checked out (~${proximity.distance} m apart).`,
+    visitor: { fullName: visitor.full_name, phone: visitor.phone, email: visitor.email, organization: visitor.organization, hostName: visitor.host_name, hostDepartment: visitor.host_department, purpose: visitor.purpose, vehicleNumber: visitor.vehicle_number },
+    scannedAt: new Date(now).toISOString(),
+  });
 });
 
 const distPath = path.join(projectRoot, "dist");
@@ -666,5 +901,7 @@ app.use((req, res, next) => {
 });
 const port = Number(process.env.PORT || 5000);
 const server = app.listen(port, "0.0.0.0", () => console.log(`CampusPass listening on port ${port}; SQLite database: ${databasePath}`));
-server.on("close", () => console.log("server close event fired"));
-server.on("error", (err) => console.log("server error event fired:", err));
+server.on("error", (err) => {
+  console.error("Server error:", err);
+  process.exit(1);
+});
