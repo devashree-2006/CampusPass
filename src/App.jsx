@@ -31,6 +31,21 @@ async function request(path, options = {}, authToken = '') {
   return data
 }
 
+function formatLocalIsoDate(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function distanceMetresClient(lat1, lon1, lat2, lon2) {
+  const toRad = (degrees) => (degrees * Math.PI) / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLon = toRad(lon2 - lon1)
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
 function getLocation() {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) return reject(new Error('Location is not available in this browser.'))
@@ -45,8 +60,20 @@ function getLocation() {
 function App() {
   const [mode, setMode] = useState('teacher')
   const [className, setClassName] = useState('')
+  const [availableClasses, setAvailableClasses] = useState([
+    { className: 'CSE 3A', studentCount: 65 },
+    { className: 'CSE 3B', studentCount: 64 },
+    { className: 'CSE 3C', studentCount: 63 },
+  ])
   const [teacherName, setTeacherName] = useState(() => sessionStorage.getItem('campuspass.teacherDisplayName') || '')
-  const [historyDays, setHistoryDays] = useState(15)
+  const [historyPeriod, setHistoryPeriod] = useState('15')
+  const [historyStartDate, setHistoryStartDate] = useState(() => {
+    const d = new Date()
+    d.setDate(d.getDate() - 14)
+    return formatLocalIsoDate(d)
+  })
+  const [historyEndDate, setHistoryEndDate] = useState(() => formatLocalIsoDate(new Date()))
+  const [historyFilter, setHistoryFilter] = useState('all')
   const [historyReport, setHistoryReport] = useState(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [cameraZoom, setCameraZoom] = useState(1)
@@ -63,6 +90,8 @@ function App() {
   const [assistantBusy, setAssistantBusy] = useState(false)
   const [session, setSession] = useState(null)
   const [attendees, setAttendees] = useState([])
+  const [absentees, setAbsentees] = useState([])
+  const [registeredCount, setRegisteredCount] = useState(0)
   const [attendanceQr, setAttendanceQr] = useState(null)
   const [attendanceQrSeconds, setAttendanceQrSeconds] = useState(0)
   const [studentId, setStudentId] = useState('')
@@ -81,6 +110,8 @@ function App() {
   const emergencyControlsRef = useRef(null)
 
   const [visitor, setVisitor] = useState({ fullName: '', phone: '', email: '', organization: '', hostName: '', hostDepartment: '', purpose: '', vehicleNumber: '' })
+  const [visitorLocation, setVisitorLocation] = useState(null)
+  const [visitorLocationBusy, setVisitorLocationBusy] = useState(false)
   const [visitorPassId, setVisitorPassId] = useState(() => sessionStorage.getItem('campuspass.visitorPass') || '')
   const [identityVerified, setIdentityVerified] = useState(false)
   const [showEmergency, setShowEmergency] = useState(false)
@@ -95,6 +126,8 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   const [visitorQrSeconds, setVisitorQrSeconds] = useState(0)
   const [securityToken, setSecurityToken] = useState(() => sessionStorage.getItem('campuspass.securityToken') || '')
   const [guardUsername, setGuardUsername] = useState(() => sessionStorage.getItem('campuspass.guardName') || '')
+  const [guardLocation, setGuardLocation] = useState(null)
+  const [guardLocationBusy, setGuardLocationBusy] = useState(false)
   const [securityLoadError, setSecurityLoadError] = useState('')
   const [login, setLogin] = useState({ username: '', password: '' })
   const [securityData, setSecurityData] = useState({ inside: [], insideCount: 0, recentEvents: [], approvalQueue: [] })
@@ -110,6 +143,8 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     try {
       const data = await request(`/api/attendance/${encodeURIComponent(token)}/records`, {}, teacherToken)
       setAttendees(data.records || [])
+      setAbsentees(data.absentees || [])
+      setRegisteredCount(data.registeredCount || 0)
     } catch { /* the session can expire while this screen remains open */ }
   }, [teacherToken])
 
@@ -234,6 +269,15 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   }, [attendanceQr])
 
   useEffect(() => {
+    if (!teacherToken) return undefined
+    let active = true
+    request('/api/teacher/classes', {}, teacherToken)
+      .then((data) => { if (active && Array.isArray(data.classes) && data.classes.length) setAvailableClasses(data.classes) })
+      .catch(() => { /* fallback list remains usable */ })
+    return () => { active = false }
+  }, [teacherToken])
+
+  useEffect(() => {
   if (!securityToken) return undefined
 
   const refresh = () => {
@@ -241,7 +285,23 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     loadEmergencyRollCall(securityToken)
   }
 
-  const initial = window.setTimeout(refresh, 0)
+  const refreshGuardLocationIfGranted = async () => {
+    try {
+      if (navigator.permissions?.query) {
+        const status = await navigator.permissions.query({ name: 'geolocation' })
+        if (status.state !== 'granted') return
+      } else {
+        return
+      }
+      const loc = await getLocation()
+      setGuardLocation(loc)
+    } catch { /* optional background GPS refresh */ }
+  }
+
+  const initial = window.setTimeout(() => {
+    refresh()
+    void refreshGuardLocationIfGranted()
+  }, 0)
   const timer = window.setInterval(refresh, 5000)
 
   return () => {
@@ -294,6 +354,19 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   useEffect(() => {
     if (!visitorPassId) return undefined
     let active = true
+    const syncVisitorPassLocation = async () => {
+      try {
+        if (!navigator.permissions?.query) return
+        const perm = await navigator.permissions.query({ name: 'geolocation' })
+        if (perm.state !== 'granted') return
+        const loc = await getLocation()
+        if (!active) return
+        await request(`/api/visitors/${encodeURIComponent(visitorPassId)}/location`, {
+          method: 'POST',
+          body: JSON.stringify({ visitorLat: loc.lat, visitorLon: loc.lon, visitorAccuracy: loc.accuracy }),
+        })
+      } catch { /* registration GPS remains stored if live refresh is unavailable */ }
+    }
     const refresh = async () => {
       try {
         const data = await request(`/api/visitors/${encodeURIComponent(visitorPassId)}/qr`)
@@ -301,7 +374,11 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
       } catch (error) { if (active) setMessage({ type: 'error', text: error.message }) }
     }
     refresh()
-    const timer = window.setInterval(refresh, 10000)
+    void syncVisitorPassLocation()
+    const timer = window.setInterval(() => {
+      refresh()
+      void syncVisitorPassLocation()
+    }, 10000)
     return () => { active = false; window.clearInterval(timer) }
   }, [visitorPassId])
 
@@ -327,10 +404,19 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
 
   const scanVisitorQr = useCallback(async (payload) => {
     setBusy(true); setMessage(null)
-    let location = {}
-    try { location = await getLocation() } catch { /* gate scans remain available if GPS is blocked */ }
     try {
-      const data = await request('/api/security/scan', { method: 'POST', body: JSON.stringify({ payload, latitude: location.lat, longitude: location.lon, identityVerified }) }, securityToken)
+      const location = await getLocation()
+      setGuardLocation(location)
+      const data = await request('/api/security/scan', {
+        method: 'POST',
+        body: JSON.stringify({
+          payload,
+          latitude: location.lat,
+          longitude: location.lon,
+          accuracy: location.accuracy,
+          identityVerified,
+        }),
+      }, securityToken)
       setMessage({ type: 'success', text: `${data.message} ${data.visitor.fullName} · ${data.visitor.purpose}` })
       await loadSecurityDashboard(securityToken)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
@@ -391,7 +477,8 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     try {
       const location = await getLocation()
       const data = await request('/api/attendance/start', { method: 'POST', body: JSON.stringify({ teacherName: teacherName.trim(), teacherLat: location.lat, teacherLon: location.lon, teacherAccuracy: location.accuracy, className: className.trim() }) }, teacherToken)
-      setSession(data); setAttendees([]); setAttendanceQr(null)
+      setSession(data); setAttendees([]); setAbsentees([]); setRegisteredCount(0); setAttendanceQr(null)
+      void loadAttendees(data.token)
       sessionStorage.setItem('campuspass.teacherDisplayName', teacherName.trim())
       setMessage({ type: 'success', text: 'Attendance is open. Students can scan this QR code now.' })
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
@@ -412,7 +499,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   async function teacherLogout() {
     try { await request('/api/teacher/logout', { method: 'POST' }, teacherToken) } catch { /* local sign-out still completes */ }
     sessionStorage.removeItem('campuspass.teacherToken'); sessionStorage.removeItem('campuspass.teacherName')
-    setTeacherToken(''); setTeacherUsername(''); setSession(null); setAttendees([])
+    setTeacherToken(''); setTeacherUsername(''); setSession(null); setAttendees([]); setAbsentees([]); setRegisteredCount(0)
   }
 
   async function adminLogin(event) {
@@ -459,35 +546,94 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
   }
 
+  function buildAttendanceHistoryQuery() {
+    const query = new URLSearchParams({ className: className.trim() })
+    if (teacherName.trim()) query.set('teacherName', teacherName.trim())
+    if (historyPeriod === 'custom') {
+      query.set('startDate', historyStartDate)
+      query.set('endDate', historyEndDate)
+      query.set('tzOffset', String(new Date().getTimezoneOffset()))
+    } else {
+      query.set('days', historyPeriod)
+    }
+    return query
+  }
+
   function attendanceHistoryPath() {
-    const query = new URLSearchParams({ teacherName: teacherName.trim(), className: className.trim(), days: String(historyDays) })
-    return `/api/teacher/attendance-range.csv?${query.toString()}`
+    return `/api/teacher/attendance-range.csv?${buildAttendanceHistoryQuery().toString()}`
   }
 
   async function loadAttendanceHistory() {
-    if (!teacherName.trim() || !className.trim()) {
-      setMessage({ type: 'error', text: 'Enter your teacher name and class to view attendance history.' })
+    if (!className.trim()) {
+      setMessage({ type: 'error', text: 'Select or enter a class to view attendance history.' })
       return
+    }
+    if (historyPeriod === 'custom') {
+      if (!historyStartDate || !historyEndDate) {
+        setMessage({ type: 'error', text: 'Select both From date and To date.' })
+        return
+      }
+      if (historyStartDate > historyEndDate) {
+        setMessage({ type: 'error', text: 'From date must be on or before To date.' })
+        return
+      }
     }
     setHistoryLoading(true); setMessage(null)
     try {
-      const query = new URLSearchParams({ teacherName: teacherName.trim(), className: className.trim(), days: String(historyDays) })
-      setHistoryReport(await request(`/api/teacher/attendance-summary?${query.toString()}`, {}, teacherToken))
+      setHistoryReport(await request(`/api/teacher/attendance-summary?${buildAttendanceHistoryQuery().toString()}`, {}, teacherToken))
+      setHistoryFilter('all')
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setHistoryLoading(false) }
+  }
+
+  function buildAttendanceSummaryMessage(report) {
+    const header = [
+      'CampusPass Attendance Report',
+      `Class: ${report.className}${report.teacherName ? ` | Teacher: ${report.teacherName}` : ''}`,
+      `Period: ${report.rangeLabel || (report.days ? `Last ${report.days} days` : '')}`,
+      `Classes held: ${report.totalSessions} | Total students: ${report.students.length} | 0% Absentees: ${report.zeroAttendanceCount || 0}`,
+    ].join('\n')
+    const lines = report.students.map((student) => `${student.studentId}: ${student.attendedSessions}/${student.totalSessions} (${student.percentage}%)`)
+    const fullBody = `${header}\n\n${lines.join('\n')}`
+    if (fullBody.length <= 1800) return fullBody
+    const lowStudents = report.students.filter((student) => student.percentage < 75)
+    const compactLines = lowStudents.slice(0, 50).map((student) => `${student.studentId}: ${student.attendedSessions}/${student.totalSessions} (${student.percentage}%)`)
+    return `${header}\n\nAbsentees & below 75%:\n${compactLines.join('\n')}${lowStudents.length > 50 ? `\n...and ${lowStudents.length - 50} more (download CSV for full list).` : ''}`
+  }
+
+  function buildStudentParentMessage(report, student) {
+    return [
+      'CampusPass Parent Attendance Update',
+      `Student USN: ${student.studentId}`,
+      `Class: ${report.className}${report.teacherName ? ` | Teacher: ${report.teacherName}` : ''}`,
+      `Period: ${report.rangeLabel || ''}`,
+      `Attendance: ${student.attendedSessions} / ${student.totalSessions} classes (${student.percentage}%)`,
+      student.percentage === 0
+        ? 'Status: Marked ABSENT (0%) for all classes in this period.'
+        : `Classes missed: ${student.absentSessions}`,
+    ].join('\n')
+  }
+
+  function shareOnWhatsApp(text) {
+    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer')
+  }
+
+  function shareOnGmail(subject, text) {
+    window.open(`https://mail.google.com/mail/?view=cm&fs=1&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer')
   }
 
   async function downloadAttendanceHistory(share = false) {
     try {
       const response = await fetch(`${API}${attendanceHistoryPath()}`, { headers: { Authorization: `Bearer ${teacherToken}` } })
       if (!response.ok) throw new Error('Could not download this attendance report.')
-      const file = new File([await response.blob()], `campuspass-${className.trim().replace(/[^a-z0-9]+/gi, '-')}-${historyDays}-day-attendance.csv`, { type: 'text/csv' })
+      const rangeSlug = historyPeriod === 'custom' ? `${historyStartDate}-to-${historyEndDate}` : `${historyPeriod}-day`
+      const file = new File([await response.blob()], `campuspass-${className.trim().replace(/[^a-z0-9]+/gi, '-')}-${rangeSlug}-attendance.csv`, { type: 'text/csv' })
       if (share && navigator.share && navigator.canShare?.({ files: [file] })) {
-        await navigator.share({ files: [file], title: `${className} attendance`, text: `${teacherName} · ${className} · last ${historyDays} days` })
+        await navigator.share({ files: [file], title: `${className} attendance`, text: `${className} · ${historyReport?.rangeLabel || rangeSlug}` })
       } else {
         const url = URL.createObjectURL(file)
         const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.name; anchor.click(); URL.revokeObjectURL(url)
-        if (share) setMessage({ type: 'success', text: 'Report downloaded. Attach the CSV to your parents’ group from your messaging app.' })
+        if (share) setMessage({ type: 'success', text: 'Report downloaded. You can also share directly using the WhatsApp or Gmail buttons.' })
       }
     } catch (error) { if (error.name !== 'AbortError') setMessage({ type: 'error', text: error.message }) }
   }
@@ -505,22 +651,89 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
     finally { setBusy(false) }
   }
 
+  async function captureVisitorLocation() {
+    setVisitorLocationBusy(true); setMessage(null)
+    try {
+      const loc = await getLocation()
+      setVisitorLocation(loc)
+      return loc
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+      return null
+    } finally {
+      setVisitorLocationBusy(false)
+    }
+  }
+
+  async function refreshVisitorPassLocation() {
+    if (!visitorPassId) return
+    setVisitorLocationBusy(true); setMessage(null)
+    try {
+      const loc = await getLocation()
+      await request(`/api/visitors/${encodeURIComponent(visitorPassId)}/location`, {
+        method: 'POST',
+        body: JSON.stringify({ visitorLat: loc.lat, visitorLon: loc.lon, visitorAccuracy: loc.accuracy }),
+      })
+      setVisitorLocation(loc)
+      setMessage({ type: 'success', text: `Your GPS location was updated (±${Math.round(loc.accuracy)} m).` })
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setVisitorLocationBusy(false)
+    }
+  }
+
   async function createVisitorPass(event) {
     event.preventDefault(); setBusy(true); setMessage(null)
     try {
-      const data = await request('/api/visitors', { method: 'POST', body: JSON.stringify(visitor) })
+      const loc = visitorLocation || await getLocation()
+      setVisitorLocation(loc)
+      const data = await request('/api/visitors', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...visitor,
+          visitorLat: loc.lat,
+          visitorLon: loc.lon,
+          visitorAccuracy: loc.accuracy,
+        }),
+      })
       sessionStorage.setItem('campuspass.visitorPass', data.passId)
       setVisitorPassId(data.passId)
-      setMessage({ type: 'success', text: 'Request sent to campus security. Your rotating QR activates after approval.' })
+      setMessage({ type: 'success', text: 'Request and GPS location sent to campus security. Your rotating QR activates after approval.' })
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
+  }
+
+  async function captureGuardLocation() {
+    setGuardLocationBusy(true); setMessage(null)
+    try {
+      const loc = await getLocation()
+      setGuardLocation(loc)
+      return loc
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+      return null
+    } finally {
+      setGuardLocationBusy(false)
+    }
   }
 
   async function decideSecurityApproval(passId, decision) {
     setBusy(true); setMessage(null)
     try {
-      await request(`/api/security/visitor-approvals/${encodeURIComponent(passId)}`, { method: 'POST', body: JSON.stringify({ decision }) }, securityToken)
-      setMessage({ type: 'success', text: decision === 'approved' ? 'Visitor approved. Their pass is now active.' : 'Visitor request declined.' })
+      let body = { decision }
+      if (decision === 'approved') {
+        const location = await getLocation()
+        setGuardLocation(location)
+        body = { decision, guardLat: location.lat, guardLon: location.lon, guardAccuracy: location.accuracy }
+      }
+      const data = await request(`/api/security/visitor-approvals/${encodeURIComponent(passId)}`, { method: 'POST', body: JSON.stringify(body) }, securityToken)
+      setMessage({
+        type: 'success',
+        text: decision === 'approved'
+          ? `Visitor approved (~${data.distance ?? 0} m apart · location verified). Their pass is now active.`
+          : 'Visitor request declined.',
+      })
       await loadSecurityDashboard(securityToken)
     } catch (error) { setMessage({ type: 'error', text: error.message }) }
     finally { setBusy(false) }
@@ -566,6 +779,11 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
   const emergencyTerm = emergencySearch.trim().toLowerCase()
   const filteredStudents = (securityData.presentStudents || []).filter((row) => [row.className, row.teacherName, row.studentId].join(' ').toLowerCase().includes(emergencyTerm))
   const filteredInside = (securityData.inside || []).filter((row) => [row.fullName, row.organization, row.hostName].join(' ').toLowerCase().includes(emergencyTerm))
+  const filteredHistoryStudents = historyReport
+    ? historyReport.students.filter((student) => (
+      historyFilter === 'absent' ? student.percentage === 0 : historyFilter === 'low' ? student.percentage < 75 : true
+    ))
+    : []
 
   const expired = session && remaining === 0
   const switchMode = (nextMode) => { stopCamera(); setMode(nextMode); setMessage(null) }
@@ -602,7 +820,23 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
               <div className="card-heading"><span className="step-number">01</span><div><h2>Set up your session</h2><p>Share a few details to get started.</p></div></div>
             <form onSubmit={startAttendance}>
                 <label htmlFor="teacher-display-name">Teacher name</label><input id="teacher-display-name" value={teacherName} onChange={(e) => setTeacherName(e.target.value)} placeholder="e.g. Dr. Sharma" autoComplete="name" maxLength={100} required />
-                <label htmlFor="class-name">Class or subject</label><input id="class-name" value={className} onChange={(e) => setClassName(e.target.value)} placeholder="e.g. Biology · Room 204" required />
+                <label htmlFor="class-name">Class or subject</label>
+                <input id="class-name" list="campuspass-classes" value={className} onChange={(e) => { setClassName(e.target.value); setHistoryReport(null) }} placeholder="e.g. CSE 3A" required />
+                <datalist id="campuspass-classes">
+                  {availableClasses.map((item) => <option key={item.className} value={item.className} />)}
+                </datalist>
+                <div className="class-quick-picks" role="group" aria-label="Registered classes">
+                  {availableClasses.map((item) => (
+                    <button
+                      type="button"
+                      key={item.className}
+                      className={`class-chip ${className.trim().toUpperCase() === item.className.toUpperCase() ? 'active' : ''}`}
+                      onClick={() => { setClassName(item.className); setHistoryReport(null) }}
+                    >
+                      {item.className} <small>({item.studentCount})</small>
+                    </button>
+                  ))}
+                </div>
                 <div className="location-note"><span>◎</span><div><strong>Your location anchors this session</strong><small>GPS accuracy is included in the 50 metre check.</small></div></div>
                 <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Getting your location…' : '↗  Start attendance'}</button>
               </form>
@@ -617,14 +851,55 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
               </> : <div className="empty-session"><div className="qr-placeholder">▦</div><h2>Your QR code appears here</h2><p>Start an attendance session to create a secure, time-limited check-in code.</p><div className="session-meta"><span>⌖  50 m location check</span><span>◷  5 minute session</span></div></div>}
             </div>
             <div className="card roster-card">
-              <div className="roster-heading"><div><div className="eyebrow">LIVE ROSTER</div><h2>Class check-ins</h2></div><span className="count-pill">{attendees.length} present</span></div>
+              <div className="roster-heading"><div><div className="eyebrow">LIVE ROSTER</div><h2>Class check-ins</h2></div><span className="count-pill">{attendees.length} present{registeredCount ? ` · ${absentees.length} absent` : ''}</span></div>
               {attendees.length ? <div className="roster-list">{attendees.map((person) => <div className="roster-person" key={person.studentId}><span className="avatar">{person.studentId.slice(0, 1).toUpperCase()}</span><strong>{person.studentId}</strong><span>{new Date(person.markedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span><b>✓</b></div>)}</div> : <div className="roster-empty">{session ? 'Waiting for students to check in…' : 'Your student check-ins will appear here.'}</div>}
+              {session && registeredCount > 0 && absentees.length > 0 && (
+                <div className="live-absentees-box">
+                  <strong>Absentees / not yet checked in ({absentees.length})</strong>
+                  <div className="absentee-chips">{absentees.map((usn) => <span key={usn}>{usn}</span>)}</div>
+                </div>
+              )}
             </div>
           </section>
           <section className="card attendance-history-card">
-            <div className="roster-heading"><div><div className="eyebrow">CLASS ATTENDANCE HISTORY</div><h2>{teacherName.trim() && className.trim() ? `${className} · ${teacherName}` : 'Review attendance across sessions'}</h2><p>See how many classes each student attended and share a dated CSV report.</p></div><span className="count-pill">{historyReport ? `${historyReport.totalSessions} sessions` : '15 days'}</span></div>
-            <div className="history-controls"><label htmlFor="history-days">Period<select id="history-days" value={historyDays} onChange={(e) => { setHistoryDays(Number(e.target.value)); setHistoryReport(null) }}><option value={15}>Last 15 days</option><option value={30}>Last 30 days</option></select></label><button className="secondary-button" onClick={loadAttendanceHistory} disabled={historyLoading}>{historyLoading ? 'Loading…' : 'Load class history'}</button>{historyReport && <><button className="secondary-button" onClick={() => downloadAttendanceHistory(false)}>⇩ Download CSV</button><button className="primary-button" onClick={() => downloadAttendanceHistory(true)}>↗ Share with parents</button></>}</div>
-            {historyReport ? <><div className="history-summary"><strong>{historyReport.totalSessions}</strong><span>class sessions held</span><strong>{historyReport.students.length}</strong><span>students recorded</span></div>{historyReport.students.length ? <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Attendance</th></tr></thead><tbody>{historyReport.students.map((student) => <tr key={student.studentId}><td>{student.studentId}</td><td>{student.attendedSessions} / {student.totalSessions}</td><td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td></tr>)}</tbody></table></div> : <div className="roster-empty">No student check-ins were recorded for this class and period.</div>}<div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.map((item, index) => <span key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins</span>)}</div><div className="history-share-note">Share opens your phone’s share menu when supported. Choose the parents’ WhatsApp group to forward the CSV.</div></> : <div className="roster-empty">Enter a teacher name and class above, then load the last 15 days of attendance.</div>}
+            <div className="roster-heading"><div><div className="eyebrow">CLASS ATTENDANCE HISTORY</div><h2>{className.trim() ? `${className}${teacherName.trim() ? ` · ${teacherName}` : ''}` : 'Review attendance across sessions'}</h2><p>Track present and 0% absent students across 15 days, 30 days, or any custom date range, then share with parents on WhatsApp or Gmail.</p></div><span className="count-pill">{historyReport ? `${historyReport.totalSessions} sessions` : historyPeriod === 'custom' ? `${historyStartDate} to ${historyEndDate}` : `${historyPeriod} days`}</span></div>
+            <div className="history-controls">
+              <label htmlFor="history-days">Period
+                <select id="history-days" value={historyPeriod} onChange={(e) => { setHistoryPeriod(e.target.value); setHistoryReport(null) }}>
+                  <option value="15">Last 15 days</option>
+                  <option value="30">Last 30 days</option>
+                  <option value="custom">Custom date range</option>
+                </select>
+              </label>
+              {historyPeriod === 'custom' && <>
+                <label htmlFor="history-start-date">From date<input id="history-start-date" type="date" value={historyStartDate} onChange={(e) => { setHistoryStartDate(e.target.value); setHistoryReport(null) }} /></label>
+                <label htmlFor="history-end-date">To date<input id="history-end-date" type="date" value={historyEndDate} onChange={(e) => { setHistoryEndDate(e.target.value); setHistoryReport(null) }} /></label>
+              </>}
+              <button className="secondary-button" onClick={loadAttendanceHistory} disabled={historyLoading}>{historyLoading ? 'Loading…' : 'Load class history'}</button>
+              {historyReport && <>
+                <button className="secondary-button" onClick={() => downloadAttendanceHistory(false)}>⇩ Download CSV</button>
+                <button className="primary-button whatsapp-button" onClick={() => shareOnWhatsApp(buildAttendanceSummaryMessage(historyReport))}>💬 Share on WhatsApp</button>
+                <button className="secondary-button gmail-button" onClick={() => shareOnGmail(`${historyReport.className} Attendance (${historyReport.rangeLabel})`, buildAttendanceSummaryMessage(historyReport))}>✉ Share on Gmail</button>
+                <button className="secondary-button" onClick={() => downloadAttendanceHistory(true)}>↗ Share CSV</button>
+              </>}
+            </div>
+            {historyReport ? <>
+              <div className="history-summary">
+                <strong>{historyReport.totalSessions}</strong><span>class sessions held</span>
+                <strong>{historyReport.students.length}</strong><span>students in roster</span>
+                <strong>{historyReport.zeroAttendanceCount || 0}</strong><span>at 0% (absent)</span>
+              </div>
+              {historyReport.students.length > 0 && (
+                <div className="history-filter-tabs" role="group" aria-label="Filter students">
+                  <button type="button" className={historyFilter === 'all' ? 'active' : ''} onClick={() => setHistoryFilter('all')}>All ({historyReport.students.length})</button>
+                  <button type="button" className={historyFilter === 'absent' ? 'active' : ''} onClick={() => setHistoryFilter('absent')}>0% Absentees ({historyReport.zeroAttendanceCount || 0})</button>
+                  <button type="button" className={historyFilter === 'low' ? 'active' : ''} onClick={() => setHistoryFilter('low')}>Below 75% ({historyReport.students.filter((s) => s.percentage < 75).length})</button>
+                </div>
+              )}
+              {filteredHistoryStudents.length ? <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Student ID</th><th>Attended</th><th>Absent</th><th>Attendance</th><th>Notify parent</th></tr></thead><tbody>{filteredHistoryStudents.map((student) => <tr key={student.studentId}><td>{student.studentId}</td><td>{student.attendedSessions} / {student.totalSessions}</td><td>{student.absentSessions}</td><td><span className={`attendance-rate ${student.percentage < 75 ? 'low' : ''}`}>{student.percentage}%</span></td><td className="parent-share-cell"><button type="button" className="mini-share-btn whatsapp" onClick={() => shareOnWhatsApp(buildStudentParentMessage(historyReport, student))}>WhatsApp</button><button type="button" className="mini-share-btn gmail" onClick={() => shareOnGmail(`${student.studentId} · ${historyReport.className} Attendance`, buildStudentParentMessage(historyReport, student))}>Gmail</button></td></tr>)}</tbody></table></div> : <div className="roster-empty">No matching students for this class and period.</div>}
+              <div className="history-session-list"><strong>Sessions included in report</strong>{historyReport.sessions.length ? historyReport.sessions.map((item, index) => <span key={item.token}>Session {index + 1} · {new Date(item.createdAt).toLocaleString()} · {item.attendanceCount} check-ins</span>) : <span>No sessions held in this date range yet. Registered students are shown at 0%.</span>}</div>
+              <div className="history-share-note">Use Share on WhatsApp or Share on Gmail for the whole class summary, or notify an individual student’s parent directly from any row.</div>
+            </> : <div className="roster-empty">Select a class above (e.g. CSE 3A, CSE 3B, or CSE 3C) and load attendance for 15 days, 30 days, or a custom date range.</div>}
           </section>
           </> : <section className="security-login-layout teacher-login-layout"><div className="card security-login-card"><div className="security-lock">✳</div><div className="eyebrow">FACULTY ACCESS</div><h2>Teacher sign in</h2><p>Sign in to start a class session and download its attendance roster.</p><form onSubmit={teacherLogin}><label htmlFor="teacher-user">Username</label><input id="teacher-user" autoComplete="username" value={teacherLoginForm.username} onChange={(e) => setTeacherLoginForm({ ...teacherLoginForm, username: e.target.value })} required /><label htmlFor="teacher-password">Password</label><input id="teacher-password" type="password" autoComplete="current-password" value={teacherLoginForm.password} onChange={(e) => setTeacherLoginForm({ ...teacherLoginForm, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in as teacher'}</button></form></div><aside className="card how-card"><div className="eyebrow">FIVE MINUTE SESSION</div><h2>One class, one attendance file.</h2><p>Every valid student check-in during the session appears together in the teacher’s downloadable roster.</p></aside></section>}
         </>}
@@ -678,7 +953,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
             <div className="card-heading"><span className="step-number">01</span><div><h2>Scan your class QR</h2><p>Point your camera at the code shown by your teacher.</p></div></div>
             {scanOn && scanPurpose === 'attendance' ? <><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close camera</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /></> : <button type="button" className="scan-button" onClick={() => { setMessage(null); setScanPurpose('attendance'); setScanOn(true) }}><span className="scan-symbol">▦</span><span><strong>Open camera to scan</strong><small>Fast QR scanning · back camera preferred</small></span><b>→</b></button>}
             <div className="or-divider"><span /> or enter QR code <span /></div>
-            <form onSubmit={markAttendance}><label htmlFor="qr-code">QR code text</label><textarea id="qr-code" rows="2" value={qrInput} onChange={(e) => setQrInput(e.target.value)} placeholder="Paste the code text here" /><label htmlFor="student-id">Your student ID</label><input id="student-id" value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. STU2024012" required /><div className="location-note"><span>◎</span><div><strong>One student ID per device, per session</strong><small>This browser is linked to the first student ID it submits for a class session. Use your own ID and device.</small></div></div><button className="primary-button" type="submit" disabled={busy || !studentId.trim()}>{busy ? 'Checking location…' : '✓  Mark my attendance'}</button></form>
+            <form onSubmit={markAttendance}><label htmlFor="qr-code">QR code text</label><textarea id="qr-code" rows="2" value={qrInput} onChange={(e) => setQrInput(e.target.value)} placeholder="Paste the code text here" /><label htmlFor="student-id">Your student ID</label><input id="student-id" value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. 4CB24CS001" required /><div className="location-note"><span>◎</span><div><strong>One student ID per device, per session</strong><small>This browser is linked to the first student ID it submits for a class session. Use your own ID and device.</small></div></div><button className="primary-button" type="submit" disabled={busy || !studentId.trim()}>{busy ? 'Checking location…' : '✓  Mark my attendance'}</button></form>
           </div>
           <aside className="card how-card"><div className="how-icon">✳</div><div className="eyebrow">QUICK CHECK-IN</div><h2>Simple, secure, in the room.</h2><p>Your attendance is recorded only after the QR code and your location are verified.</p><ol><li><span>1</span>Scan the code your teacher shares</li><li><span>2</span>Enter your student ID</li><li><span>3</span>Allow location to confirm check-in</li></ol><div className="privacy-note">⌖ &nbsp; GPS uncertainty is considered.</div></aside>
         </section>}
@@ -692,13 +967,26 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
               <div className="form-two"><div><label htmlFor="visitor-org">Organization</label><input id="visitor-org" value={visitor.organization} onChange={(e) => setVisitor({ ...visitor, organization: e.target.value })} placeholder="Company or institution" required /></div><div><label htmlFor="visitor-vehicle">Vehicle number <span>OPTIONAL</span></label><input id="visitor-vehicle" value={visitor.vehicleNumber} onChange={(e) => setVisitor({ ...visitor, vehicleNumber: e.target.value.toUpperCase() })} placeholder="e.g. KA 01 AB 1234" /></div></div>
               <div className="form-two"><div><label htmlFor="host-name">Person you are meeting</label><input id="host-name" value={visitor.hostName} onChange={(e) => setVisitor({ ...visitor, hostName: e.target.value })} placeholder="Host name" required /></div><div><label htmlFor="host-dept">Department / office</label><input id="host-dept" value={visitor.hostDepartment} onChange={(e) => setVisitor({ ...visitor, hostDepartment: e.target.value })} placeholder="e.g. Admissions" required /></div></div>
               <label htmlFor="visit-purpose">Purpose of visit</label><textarea id="visit-purpose" rows="3" value={visitor.purpose} onChange={(e) => setVisitor({ ...visitor, purpose: e.target.value })} placeholder="Briefly describe your visit" required />
-              <div className="location-note"><span>◈</span><div><strong>Your visitor pass lasts 12 hours</strong><small>Security scans it to check you in and out.</small></div></div>
-              <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Creating your pass…' : 'Create my visitor pass'}</button>
+              <div className="visitor-gps-box">
+                <div>
+                  <strong>{visitorLocation ? '✓ GPS location captured' : '◎ GPS location required'}</strong>
+                  <small>
+                    {visitorLocation
+                      ? `${visitorLocation.lat.toFixed(5)}, ${visitorLocation.lon.toFixed(5)} (±${Math.round(visitorLocation.accuracy)} m)`
+                      : 'Allow location access so campus security can verify you are at the gate.'}
+                  </small>
+                </div>
+                <button type="button" className="secondary-button" onClick={captureVisitorLocation} disabled={visitorLocationBusy}>
+                  {visitorLocationBusy ? 'Getting GPS…' : visitorLocation ? '↻ Refresh GPS' : '◎ Share my location'}
+                </button>
+              </div>
+              <div className="location-note"><span>◈</span><div><strong>Your visitor pass lasts 12 hours</strong><small>Security verifies your GPS location on approval and gate scan.</small></div></div>
+              <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Capturing GPS & creating pass…' : 'Create my visitor pass'}</button>
             </form>
           </div> : <div className="card visitor-pass-card">
             <div className="pass-status-row"><div><div className="eyebrow">YOUR CAMPUSPASS</div><h2>Visitor pass</h2></div><span className={`status-pill ${visitorPass?.status === 'inside' ? 'inside' : ''}`}>{visitorPass?.approvalStatus === 'pending' ? 'Security approval pending' : visitorPass?.approvalStatus === 'denied' ? 'Request declined' : visitorPass?.status === 'inside' ? 'On campus' : 'Ready for entry'}</span></div>
-            <div className="visitor-pass-content">{visitorQr?.qrCode ? <div className="visitor-qr-wrap"><img src={visitorQr.qrCode} alt="Rotating visitor QR code" /><span>Code refreshes in {visitorQrSeconds}s</span></div> : visitorPass?.approvalStatus === 'pending' ? <div className="approval-pending"><span className="qr-placeholder">◷</span><strong>Waiting for security approval</strong><small>Campus security reviews your visit request. Your live QR will appear here after approval.</small></div> : visitorPass?.approvalStatus === 'denied' ? <div className="approval-pending"><strong>Visit request declined</strong><small>Contact campus security for next steps.</small></div> : <div className="qr-placeholder">▦</div>}
-              <div className="visitor-pass-info"><h3>{visitorPass?.fullName || visitor.fullName}</h3><p>{visitorPass?.organization || visitor.organization}</p><div className="pass-detail"><span>MEETING</span><strong>{visitorPass?.hostName || visitor.hostName}</strong><small>{visitorPass?.hostDepartment || visitor.hostDepartment}</small></div><div className="pass-detail"><span>PURPOSE</span><strong>{visitorPass?.purpose || visitor.purpose}</strong></div>{(visitorPass?.vehicleNumber || visitor.vehicleNumber) && <div className="pass-detail"><span>VEHICLE</span><strong>{visitorPass?.vehicleNumber || visitor.vehicleNumber}</strong></div>}<div className="pass-detail"><span>PASS VALID FOR</span><strong>12 hours from registration</strong></div></div>
+            <div className="visitor-pass-content">{visitorQr?.qrCode ? <div className="visitor-qr-wrap"><img src={visitorQr.qrCode} alt="Rotating visitor QR code" /><span>Code refreshes in {visitorQrSeconds}s</span></div> : visitorPass?.approvalStatus === 'pending' ? <div className="approval-pending"><span className="qr-placeholder">◷</span><strong>Waiting for security approval</strong><small>Campus security reviews your visit request and GPS proximity. Your live QR will appear here after approval.</small></div> : visitorPass?.approvalStatus === 'denied' ? <div className="approval-pending"><strong>Visit request declined</strong><small>Contact campus security for next steps.</small></div> : <div className="qr-placeholder">▦</div>}
+              <div className="visitor-pass-info"><h3>{visitorPass?.fullName || visitor.fullName}</h3><p>{visitorPass?.organization || visitor.organization}</p><div className="pass-detail"><span>MEETING</span><strong>{visitorPass?.hostName || visitor.hostName}</strong><small>{visitorPass?.hostDepartment || visitor.hostDepartment}</small></div><div className="pass-detail"><span>PURPOSE</span><strong>{visitorPass?.purpose || visitor.purpose}</strong></div>{(visitorPass?.vehicleNumber || visitor.vehicleNumber) && <div className="pass-detail"><span>VEHICLE</span><strong>{visitorPass?.vehicleNumber || visitor.vehicleNumber}</strong></div>}<div className="pass-detail"><span>GPS LOCATION</span><strong>{visitorPass?.hasLocation ? 'Recorded for gate check' : 'Pending'}</strong><button type="button" className="same-device-button" onClick={refreshVisitorPassLocation} disabled={visitorLocationBusy}>{visitorLocationBusy ? 'Updating GPS…' : '↻ Update my current GPS'}</button></div><div className="pass-detail"><span>PASS VALID FOR</span><strong>12 hours from registration</strong></div></div>
             </div><div className="privacy-note">Show the live code to security at entry. When leaving, show the refreshed code again so the guard can record your exit.</div>
           </div>}
           <aside className="card how-card visitor-how"><div className="how-icon">◈</div><div className="eyebrow">VISITOR ACCESS</div><h2>A smooth arrival, from gate to host.</h2><p>Your pass keeps your visit details together for the security team.</p><ol><li><span>1</span>Register your details and host</li><li><span>2</span>Wait for security to approve your request</li><li><span>3</span>Show your QR at entry, then again at exit</li></ol><div className="privacy-note">⌖ &nbsp; The pass stays active for 12 hours.</div></aside>
@@ -717,7 +1005,54 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
           {securityLoadError && <div className="notice error" role="alert"><span>!</span>{securityLoadError}</div>}
           <div className="security-stats"><div className="card stat-card"><span className="stat-icon">⌖</span><div><strong>{securityData.insideCount}</strong><span>Visitors on campus</span></div></div><div className="card stat-card"><span className="stat-icon">◷</span><div><strong>{securityData.attendanceToday || 0}</strong><span>Attendance today</span></div></div><div className="card stat-card"><span className="stat-icon">↗</span><div><strong>{securityData.visitorsToday || 0}</strong><span>Visitor check-ins today</span></div></div><div className="card stat-card"><span className="stat-icon">!</span><div><strong>{securityData.pendingApprovals || 0}</strong><span>Security approvals pending</span></div></div><div className="card scan-launch-card"><div><strong>Gate check-in and exit</strong><span>Scan on arrival; scan again when leaving.</span></div><button className="primary-button" onClick={() => { setIdentityVerified(false); setScanPurpose('visitor'); setScanOn(true) }}>▦ &nbsp; Scan entry or exit</button></div></div>
           {scanOn && scanPurpose === 'visitor' && <div className="card security-camera-card"><label className="id-check"><input type="checkbox" checked={identityVerified} onChange={(event) => setIdentityVerified(event.target.checked)} /> I matched the visitor’s photo ID for entry</label><div className="camera-box"><video ref={videoRef} playsInline muted /><div className="scan-frame" /><button className="camera-close" onClick={stopCamera}>Close scanner</button></div><CameraZoomControl range={cameraZoomRange} value={cameraZoom} onChange={applyCameraZoom} /><p>Entry: confirm the photo ID before scanning. Exit: scan the visitor’s refreshed QR code again.</p></div>}
-          <div className="card security-list-card approval-queue"><div className="roster-heading"><div><div className="eyebrow">VISITOR ACCESS</div><h2>Requests awaiting security approval</h2><p>Review visitor details before activating a pass.</p></div><span className="count-pill">{securityData.approvalQueue?.length || 0} pending</span></div>{securityData.approvalQueue?.length ? <div className="approval-queue-list">{securityData.approvalQueue.map((person) => <article className="approval-request" key={person.passId}><div><strong>{person.fullName}</strong><span>{person.organization} · {person.phone} · {person.email}</span><small>Meeting {person.hostName} · {person.hostDepartment}</small><small>{person.purpose}{person.vehicleNumber ? ` · Vehicle ${person.vehicleNumber}` : ''}</small></div><div className="approval-actions"><button className="primary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'approved')}>Approve</button><button className="secondary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'denied')}>Decline</button></div></article>)}</div> : <div className="roster-empty">No visitor requests are waiting for security approval.</div>}</div>
+          <div className="card security-list-card approval-queue">
+            <div className="roster-heading">
+              <div>
+                <div className="eyebrow">VISITOR ACCESS</div>
+                <h2>Requests awaiting security approval</h2>
+                <p>Verify the visitor is in the same GPS location before approving or scanning.</p>
+              </div>
+              <div className="approval-queue-tools">
+                <button type="button" className="secondary-button" onClick={captureGuardLocation} disabled={guardLocationBusy}>
+                  {guardLocationBusy ? 'Checking GPS…' : guardLocation ? `◎ Gate GPS (±${Math.round(guardLocation.accuracy)} m)` : '◎ Check gate GPS'}
+                </button>
+                <span className="count-pill">{securityData.approvalQueue?.length || 0} pending</span>
+              </div>
+            </div>
+            {securityData.approvalQueue?.length ? <div className="approval-queue-list">{securityData.approvalQueue.map((person) => {
+              const hasVisitorLoc = Number.isFinite(person.visitorLat) && Number.isFinite(person.visitorLon)
+              let proximityBadge
+              if (hasVisitorLoc && guardLocation) {
+                const rawDistance = Math.round(distanceMetresClient(person.visitorLat, person.visitorLon, guardLocation.lat, guardLocation.lon))
+                const allowance = Math.min(100, Math.round((person.visitorAccuracy || 0) + (guardLocation.accuracy || 0)))
+                const samePlace = Math.max(0, rawDistance - allowance) <= 50
+                proximityBadge = (
+                  <small className={`gps-match-badge ${samePlace ? 'match' : 'mismatch'}`}>
+                    {samePlace ? `✓ Same place (~${rawDistance} m apart)` : `! Different location (~${rawDistance} m apart)`}
+                  </small>
+                )
+              } else if (hasVisitorLoc) {
+                proximityBadge = <small className="gps-match-badge pending">⌖ Visitor GPS captured · Approve or Check gate GPS to verify distance</small>
+              } else {
+                proximityBadge = <small className="gps-match-badge mismatch">! Visitor GPS missing</small>
+              }
+              return (
+                <article className="approval-request" key={person.passId}>
+                  <div>
+                    <strong>{person.fullName}</strong>
+                    <span>{person.organization} · {person.phone} · {person.email}</span>
+                    <small>Meeting {person.hostName} · {person.hostDepartment}</small>
+                    <small>{person.purpose}{person.vehicleNumber ? ` · Vehicle ${person.vehicleNumber}` : ''}</small>
+                    {proximityBadge}
+                  </div>
+                  <div className="approval-actions">
+                    <button className="primary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'approved')}>Approve</button>
+                    <button className="secondary-button" disabled={busy} onClick={() => decideSecurityApproval(person.passId, 'denied')}>Decline</button>
+                  </div>
+                </article>
+              )
+            })}</div> : <div className="roster-empty">No visitor requests are waiting for security approval.</div>}
+          </div>
           {showEmergency && <section ref={emergencyControlsRef} className="card emergency-roll-call">
           {emergencyRollCall?.active ? (
   <div className="emergency-active-panel">
@@ -812,7 +1147,7 @@ const [emergencyRollCall, setEmergencyRollCall] = useState(null)
               <div className="card security-list-card"><div className="eyebrow">VISITORS CURRENTLY INSIDE</div>{filteredInside.length ? <div className="visitor-table">{filteredInside.map((row) => <div className="visitor-row" key={row.passId}><div className="visitor-row-avatar">{row.fullName.slice(0, 1).toUpperCase()}</div><div className="visitor-row-main"><strong>{row.fullName}</strong><span>{row.organization} · Host {row.hostName}</span><small>{row.purpose}</small></div><span className="inside-pill">Inside</span></div>)}</div> : <div className="roster-empty">No matching visitors are inside.</div>}</div></div>
           </section>}
           <div className="security-panels"><div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">CURRENTLY INSIDE</div><h2>On-campus visitors</h2></div><span className="count-pill">{securityData.insideCount} inside</span></div>{securityData.inside.length ? <><p className="exit-hint">To record someone leaving, scan their refreshed visitor QR. The same scan records check-out.</p><div className="visitor-table">{securityData.inside.map((person) => <div className="visitor-row" key={person.passId}><div className="visitor-row-avatar">{person.fullName.slice(0, 1).toUpperCase()}</div><div className="visitor-row-main"><strong>{person.fullName}</strong><span>{person.organization} · Meeting {person.hostName}</span><small>{person.purpose}</small></div><div className="visitor-row-side"><strong>{person.vehicleNumber || 'No vehicle'}</strong><span>{person.phone}</span></div><span className="inside-pill">Inside</span></div>)}</div></> : <div className="roster-empty">No visitors are currently checked in.</div>}</div>
-            <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>Recent gate activity</h2></div><span className="count-pill">Live</span></div>{securityData.recentEvents.length ? <div className="event-list">{securityData.recentEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername}{event.identityVerified ? ' · Photo ID matched' : ''}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">Scanned entries and exits will appear here.</div>}</div></div>
+            <div className="card security-list-card"><div className="roster-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>Recent gate activity</h2></div><span className="count-pill">Live</span></div>{securityData.recentEvents.length ? <div className="event-list">{securityData.recentEvents.map((event) => <div className="event-row" key={event.id}><span className={`event-mark ${event.eventType === 'CHECK_OUT' ? 'out' : ''}`}>{event.eventType === 'CHECK_OUT' ? '↗' : '↙'}</span><div><strong>{event.fullName} <em>{event.eventType === 'CHECK_OUT' ? 'checked out' : 'checked in'}</em></strong><span>{event.organization} · {event.guardUsername}{event.identityVerified ? ' · Photo ID matched' : ''}{event.locationVerified ? ` · Same place (${Math.round(event.distanceMetres ?? 0)} m)` : ''}</span></div><time>{new Date(event.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>)}</div> : <div className="roster-empty">Scanned entries and exits will appear here.</div>}</div></div>
         </section>)}
 
         {mode === 'admin' && (!adminToken ? <section className="security-login-layout admin-login-layout"><div className="card security-login-card"><div className="security-lock">▤</div><div className="eyebrow">CAMPUS LEADERSHIP</div><h2>Head / admin sign in</h2><p>View attendance, visitor activity, and the recorded campus presence overview.</p><form onSubmit={adminLogin}><label htmlFor="admin-user">Username</label><input id="admin-user" autoComplete="username" value={adminLoginForm.username} onChange={(e) => setAdminLoginForm({ ...adminLoginForm, username: e.target.value })} required /><label htmlFor="admin-password">Password</label><input id="admin-password" type="password" autoComplete="current-password" value={adminLoginForm.password} onChange={(e) => setAdminLoginForm({ ...adminLoginForm, password: e.target.value })} required /><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Open admin dashboard'}</button></form></div><aside className="card how-card"><div className="eyebrow">CAMPUS OVERVIEW</div><h2>Everything important, in one place.</h2><p>See recorded student check-ins, visitor totals, gate activity, pending approvals, and currently open attendance sessions.</p></aside></section> : <section className="admin-dashboard">
